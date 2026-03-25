@@ -18,7 +18,7 @@ class DataAcquisition(QObject):
 
     """
     # Sinal para indicar que novos dados foram adquiridos
-    data_acquired = Signal(list)
+    data_acquired = Signal(list, str)  # spectrum, warn
     # Sinal para indicar que a aquisição foi finalizada
     finished = Signal()
     # Sinal para indicar erro (para mostrar mensagem na thread principal)
@@ -52,24 +52,24 @@ class DataAcquisition(QObject):
                 case 'BRAGGMETER FS22DI HBM':
                     self.device = BraggMeter(self.ip, int(self.port), False)
                 case 'THORLABS CCT11':
-                    self.device = ThorLabsCCT(osa=self.osa)
+                    self.device = ThorLabsCCT(cct=self.osa)
                 case 'THORLABS OSA203':
                     self.device = ThorLabs(osa=self.osa)
                 case _:
                     logger.error(f"Interface desconhecida: {self.inter}")
-                    self.finished.emit()
                     self.error_occurred.emit("Erro", f"Interface desconhecida: {self.inter}")
+                    self.finished.emit()
                     return
         except PermissionError as e:
             logger.error(f"Permissão negada ao abrir porta {self.port}. {e}")
-            self.finished.emit()
             self.error_occurred.emit("Erro", f"Permissão negada ao abrir porta {self.port}. Certifique-se que a porta não está em uso.")
+            self.finished.emit()
             self.device = None
             return
         except Exception as e:
             logger.error(f"Erro ao inicializar o {self.inter}: {e}")
-            self.finished.emit()
             self.error_occurred.emit("Erro", f"Falha ao inicializar o {self.inter}.")
+            self.finished.emit()
             self.device = None
             return
 
@@ -90,10 +90,11 @@ class DataAcquisition(QObject):
             self.device = None
         self.finished.emit()
 
-    def request_data(self, channel: int):
+    def request_data(self, n_mean: int, channel: int):
         """
         Solicita um novo conjunto de dados do dispositivo.
         Args:
+            n_mean (int): Número de amostras para média espectral.
             channel (int): Canal a ser lido (apenas para BraggMeter).
 
         """
@@ -102,23 +103,20 @@ class DataAcquisition(QObject):
             self.finished.emit()
             return
         try:
-            if 'BRAGGMETER' in self.inter:
-                spectrum = self.device.get_osa_trace(int(channel))
-            else:
-                spectrum = self.device.get_osa_trace()
+            spectrum, warn = self.device.get_osa_trace(n_mean, int(channel))
             if spectrum is not None:
-                self.data_acquired.emit(spectrum)
+                self.data_acquired.emit(spectrum, warn)
             else:
                 logger.warning("Falha ao ler espectro ou espectro vazio.")
         except SerialException as e:
             logger.error(f"Dispositivo desconectado: {e}", exc_info=True)
-            self.stop()
             self.error_occurred.emit("Erro de Comunicação", f"A conexão com o dispositivo na porta {self.port} foi perdida.")
+            self.stop()
             return
         except Exception as e:
             logger.error(f"Ocorreu um erro durante a execução: {e}", exc_info=True)
-            self.stop()
             self.error_occurred.emit("Erro inesperado", str(e))
+            self.stop()
             return
 
     def set_exposure_time(self, et: float):

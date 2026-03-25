@@ -1,15 +1,21 @@
-from PySide6.QtWidgets import QMainWindow, QFileDialog, QMessageBox, QGraphicsRectItem, QInputDialog, QDialog
+from PySide6.QtWidgets import QMainWindow, QFileDialog, QMessageBox, QGraphicsRectItem, QInputDialog, QDialog, QPushButton, QMenu, QApplication, QFormLayout, QSpinBox, QDialogButtonBox
+from PySide6.QtGui import QColor, QLinearGradient, QBrush, QIcon, QPalette, QGradient
 from PySide6.QtCore import Signal, QThread, QTimer, Qt
 
 from ui.AnalysisWindow_ui import Ui_AnalysisWindow
 from processing import find_resonant_wavelength
 from DataAcquisition import DataAcquisition
 
+from scipy.signal import windows, savgol_filter
 from scipy.interpolate import interp1d
 from datetime import datetime
 import pyqtgraph as pg
 import numpy as np
+import webbrowser
 import h5py
+import os
+
+from lib.PyQtDarkTheme import qdarktheme
 
 import logging
 logger = logging.getLogger(__name__)
@@ -26,7 +32,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
     """
     # Sinal para indicar à ConfigWindow que esta janela está sendo fechada
     closing = Signal()
-    request_data_signal = Signal(float)
+    request_data_signal = Signal(int, int)
 
     def __init__(self):
         super().__init__()
@@ -47,13 +53,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.temporal_roi_region: pg.LinearRegionItem | None = None
         # Limites da ROI para o processamento de picos
         self.roi_range: list | None = None
-        # Comprimentos de onda fixos para cada interface para interpolação (em metros)
-        self.fixed_wavelengths = { # usando valores padrão para as resoluções
-            'IBSEN IMON-512': np.arange(380e-9, 780e-9, .1e-9), 
-            'BRAGGMETER FS22DI': np.arange(1500e-9, 1600e-9, .1e-9),
-            'BRAGGMETER FS22DI HBM': np.arange(1500e-9, 1600e-9, .1e-9),
-            'THORLABS CCT11': np.arange(350e-9, 700e-9, .1e-9),
-            'THORLABS OSA203': np.arange(1450e-9, 1650e-9, .1e-9)}
+        # Comprimentos de onda fixos para interpolação (em metros)
+        self.fixed_wavelengths: np.ndarray | None = None
         # Dicionário de listas para armazenar os resultados processados
         self.results_df = {'Timestamp': [], 'Intensidade': [], 'ComprimentoRessonante': []}
         # Dicionário com os dados das amostras para o box plot
@@ -80,15 +81,58 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.flush_interval_ms: int = 5000
         # Limite de pontos mantidos em memória para evitar lentidão da UI
         self.max_live_points: int = 5000
-        
+        # Unidade do eixo x (comprimento de onda)
+        self.xUnit: str = 'nm'
+        # Unidade fixa para temporal/boxplot (não muda com actions de unidade)
+        self.resultUnit: str = 'nm'
+        # Tema atual da interface
+        self.theme: str = qdarktheme.get_theme()
+        self.theme_colors = {}
+        # Dicionário para armazenar os espectros fixados
+        self.fixed_traces = {}
+        # Botão de aviso (criado dinamicamente em _show_warning)
+        self.warning_btn: QPushButton | None = None
+        # Flag para indicar se a aquisiçao está ativa
+        self._running: bool = False
+        # Método de apodização aplicado no plot (None desabilita)
+        self.apodization: str | None = None
+        self.apodization_methods = {
+            'Tukey': lambda m: windows.tukey(m),
+            'Triangular': lambda m: windows.triang(m),
+            'Taylor': lambda m: windows.taylor(m),
+            'Parzen': lambda m: windows.parzen(m),
+            'Nuttall': lambda m: windows.nuttall(m),
+            'Lanczos': lambda m: windows.lanczos(m),
+            'Hann': lambda m: windows.hann(m),
+            'Hamming': lambda m: windows.hamming(m),
+            'Flat top': lambda m: windows.flattop(m),
+            'Cosine': lambda m: windows.cosine(m),
+            'Boxcar': lambda m: windows.boxcar(m),
+            'Bohman': lambda m: windows.bohman(m),
+            'Blackman-Harris 4-term': lambda m: windows.blackmanharris(m),
+            'Blackman': lambda m: windows.blackman(m),
+            'Bartlett': lambda m: windows.bartlett(m),
+            'Bartlett-Hann': lambda m: windows.barthann(m),
+        }
+        # Parametros do filtro Savitzky-Golay aplicados no plot (None desabilita)
+        self.savgol_window_points: int = 51
+        self.savgol_polyorder: int = 2
+        # Numero de amostras para o filtro de média espectral
+        self.mean_samples: int = 1
+
+        # Thread e worker para aquisição de dados
         self.thread: QThread | None = None
         self.worker: DataAcquisition | None = None
+        #Timer para solicitar dados periodicamente
         self.timer: QTimer | None = None
+        # Flag para evitar chamadas concorrentes de _cleanup_thread
         self._is_stopping = False
         
-        # Instância compartilhada de PyCCT para evitar conflito de múltiplas instâncias
+        # Instância compartilhada de PyCCT/OSA para evitar conflito de múltiplas instâncias
         self.osa = None
 
+        self.set_theme(self.theme) # Aplica o tema inicial
+        self.actionNm.setChecked(True) # Define nm como unidade inicial do eixo X
         self.setup_plot()
         self.setup_connections()
 
@@ -98,7 +142,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         
         """
         # --- Configuração do gráfico: Espectro ---
-        self.spectraPlotWidget.setBackground('w')
         self.spectraPlotWidget.setLabel('left', 'Potência', units='dBm')
         self.spectraPlotWidget.showGrid(x=False, y=True)
         xAxis = pg.AxisItem(orientation='bottom')
@@ -108,11 +151,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         # Adiciona a região de seleção (ROI)
         self.roi_region = pg.LinearRegionItem(orientation=pg.LinearRegionItem.Vertical)
-        self.roi_region.setBrush([0, 0, 255, 50])
+        self.roi_region.setBrush(self.theme_colors['roi_spec'])
         self.spectraPlotWidget.addItem(self.roi_region)
 
         # --- Configuração do gráfico: Evolução Temporal ---
-        self.temporalPlotWidget.setBackground('w')
         self.temporalPlotWidget.setLabel('bottom', 'Timestamp')
         self.temporalPlotWidget.showGrid(x=False, y=True)
         self.temporalPlotWidget.setAxisItems({'bottom': pg.DateAxisItem()})
@@ -125,11 +167,19 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.temporal_roi_region = pg.LinearRegionItem(orientation=pg.LinearRegionItem.Vertical, brush=(0, 255, 0, 30))
 
         # --- Configuração do gráfico: Box Plot ---
-        self.boxPlotWidget.setBackground('w')
         self.boxPlot = self.boxPlotWidget.addPlot()
         self.boxLegend = self.boxPlot.addLegend()
         self.boxPlot.setXRange(0, 2)
         self.boxPlot.getAxis('bottom').setTicks([]) # Remove os números do eixo X
+
+        #Ícones dos botões
+        cur_dir = os.path.dirname(__file__)
+        apo = os.path.join(cur_dir, "img", "apodization.png")
+        self.apodization_btn.setIcon(QIcon(apo))
+        svg = os.path.join(cur_dir, "img", "savgol.png")
+        self.savgol_btn.setIcon(QIcon(svg))
+        mean = os.path.join(cur_dir, "img", "mean.png")
+        self.mean_btn.setIcon(QIcon(mean))
 
     def setup_connections(self):
         """
@@ -139,7 +189,301 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.stop_btn.clicked.connect(self.toggle_thread) # Inicia/Para a aquisição de dados
         self.save_btn.clicked.connect(self.save_data) # Salva os dados processados
         self.clear_btn.clicked.connect(self.clear_plot) # Limpa os gráficos
+        self.apodization_btn.clicked.connect(self.select_apodization_method)
+        self.savgol_btn.clicked.connect(self.select_savgol_parameters)
+        self.mean_btn.clicked.connect(self.select_mean_samples)
         self.temporal_roi_region.sigRegionChanged.connect(self.roi_changed) # Atualiza o box plot mesmo com a aquisição parada
+        
+        # Botões de fixar um espectro
+        for button in self._list_fix_buttons():
+            button.setContextMenuPolicy(Qt.CustomContextMenu)
+            button.customContextMenuRequested.connect(lambda pos, btn=button: self.toggle_fix(btn, pos))
+            button.clicked.connect(lambda b, btn=button: self.fix_btn_clicked(btn, btn.isChecked()))
+
+        self.actionM.triggered.connect(lambda checked: checked and self.unit_changed('m'))
+        self.actionUm.triggered.connect(lambda checked: checked and self.unit_changed('um'))
+        self.actionNm.triggered.connect(lambda checked: checked and self.unit_changed('nm'))
+        self.actionPm.triggered.connect(lambda checked: checked and self.unit_changed('pm'))
+        self.actionLight.triggered.connect(lambda checked: checked and self.set_theme('light'))
+        self.actionDark.triggered.connect(lambda checked: checked and self.set_theme('dark'))
+        self.actionHelp.triggered.connect(lambda: webbrowser.open('https://github.com/pedroproprio/online_process_timeseries'))
+
+    def _unit_to_meter_factor(self, unit: str) -> float:
+        factors = {
+            'm': 1.0,
+            'um': 1e-6,
+            'nm': 1e-9,
+            'pm': 1e-12,
+        }
+        return factors.get(unit, 1e-9)
+
+    def _set_spectrum_axis_unit(self):
+        unit_label = {
+            'm': 'm',
+            'um': 'μm',
+            'nm': 'nm',
+            'pm': 'pm',
+        }.get(self.xUnit, 'nm')
+        self.spectraPlotWidget.setLabel('bottom', units=unit_label)
+
+    def _from_meter(self, values, unit: str):
+        return np.asarray(values, dtype=float) / self._unit_to_meter_factor(unit)
+
+    def select_apodization_method(self):
+        items = [*self.apodization_methods.keys(), 'None']
+        current_item = self.apodization if self.apodization is not None else 'None'
+        current_index = items.index(current_item)
+
+        selected, accepted = QInputDialog.getItem(
+            self,
+            'Apodização',
+            'Selecione o método:',
+            items,
+            current_index,
+            False,
+        )
+        if not accepted:
+            return
+
+        self.apodization = None if selected == 'None' else selected
+        logger.info(f" Método de apodização selecionado: {self.apodization or 'None'}")
+
+        if self.spectra_data:
+            x, y = zip(*self.spectra_data)
+            self._plot_spectrum_curve(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+
+    def _apodize_plot_data(self, y_values: np.ndarray):
+        if self.apodization is None:
+            return y_values
+
+        method = self.apodization_methods.get(self.apodization)
+        if method is None:
+            return y_values
+
+        try:
+            window = method(y_values.size)
+            window /= np.mean(window)
+            y_apodized = y_values * window
+            return y_apodized
+        except Exception as exc:
+            logger.error(f"Erro ao aplicar apodizacao '{self.apodization}': {exc}")
+            return y_values
+
+    def select_savgol_parameters(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Filtro Savitzky-Golay')
+
+        layout = QFormLayout(dialog)
+
+        window_spin = QSpinBox(dialog)
+        window_spin.setRange(3, 500)
+        window_spin.setSingleStep(2)
+        window_spin.setValue(self.savgol_window_points)
+
+        poly_spin = QSpinBox(dialog)
+        poly_spin.setRange(1, 99)
+        poly_spin.setValue(self.savgol_polyorder)
+
+        layout.addRow('Tamanho da janela:', window_spin)
+        layout.addRow('Grau do polinômio:', poly_spin)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+        layout.addRow(buttons)
+
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        window_points = int(window_spin.value())
+        polyorder = int(poly_spin.value())
+
+        if window_points % 2 == 0:
+            window_points -= 1
+
+        if polyorder >= window_points:
+            QMessageBox.warning(self, 'Filtro Savitzky-Golay', 'O grau do polinômio deve ser menor que o número de pontos da janela.')
+            return
+
+        self.savgol_window_points = window_points
+        self.savgol_polyorder = polyorder
+        logger.info(f"Filtro Savitzky-Golay configurado: janela={self.savgol_window_points}, polinômio={self.savgol_polyorder}")
+
+        if self.spectra_data:
+            x, y = zip(*self.spectra_data)
+            self._plot_spectrum_curve(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+
+    def select_mean_samples(self):
+        value, accepted = QInputDialog.getInt(
+            self,
+            'Média espectral',
+            'Número de amostras:',
+            self.mean_samples,
+            1,
+            1000,
+            1,
+        )
+        if not accepted:
+            return
+
+        self.mean_samples = int(value)
+        logger.info(f"Número de amostras para mean configurado: {self.mean_samples}")
+
+    def _visible_spectrum_brush(self, x_values: np.ndarray):
+        if x_values.size == 0:
+            return None
+
+        x_min = float(np.min(x_values))
+        x_max = float(np.max(x_values))
+        if x_max <= x_min:
+            return None
+
+        visible_min = float(self._from_meter(np.array([380e-9]), self.xUnit)[0])
+        visible_max = float(self._from_meter(np.array([730e-9]), self.xUnit)[0])
+
+        span = x_max - x_min
+
+        spectrum_stops_nm = [
+            (380, '#6a00ff'),
+            (440, '#0047ff'),
+            (490, '#00c8ff'),
+            (510, '#00ff7f'),
+            (580, '#ffff00'),
+            (640, '#ff7f00'),
+            (730, '#ff0000'),]
+
+        gradient = QLinearGradient(x_min, 0.0, x_max, 0.0)
+        gradient.setCoordinateMode(QGradient.LogicalMode)
+
+        # Fora do visível = transparente
+        transparent = QColor(0, 0, 0, 0)
+
+        start_rel = (visible_min - x_min) / span
+        end_rel = (visible_max - x_min) / span
+
+        eps = 1e-9
+
+        gradient.setColorAt(0.0, transparent)
+        gradient.setColorAt(max(0.0, start_rel - eps), transparent)
+
+        # Espectro visível
+        for wl_nm, color_hex in spectrum_stops_nm:
+            wl = float(self._from_meter(np.array([wl_nm * 1e-9]), self.xUnit)[0])
+            rel = (wl - x_min) / span
+
+            if 0.0 <= rel <= 1.0:
+                gradient.setColorAt(rel, QColor(color_hex))
+
+        gradient.setColorAt(min(1.0, end_rel + eps), transparent)
+        gradient.setColorAt(1.0, transparent)
+
+        return QBrush(gradient)
+
+    def _plot_spectrum_curve(self, x_values: np.ndarray, y_values: np.ndarray):
+        """
+        Plota o(s) espectro(s) e aplica preenchimento colorido para a faixa visível.
+        """
+        self.spectraPlotWidget.clear()
+        self.spectraPlotWidget.addItem(self.roi_region)
+
+        y_values = self._apodize_plot_data(y_values)
+        y_values = savgol_filter(y_values, self.savgol_window_points, self.savgol_polyorder)
+
+        brush = self._visible_spectrum_brush(x_values)
+        plot_kwargs = {'pen': pg.mkPen(self.theme_colors['spectrum'], width=1),}
+        if brush is not None:
+            plot_kwargs['fillLevel'] = float(np.min(y_values))
+            plot_kwargs['brush'] = brush
+
+        self.spectraPlotWidget.plot(x_values, y_values, **plot_kwargs)
+
+        for button in self._list_fix_buttons():
+            if button.isChecked():
+                if str(button) not in self.fixed_traces:
+                    continue
+                color = button.palette().color(QPalette.ColorRole.Button)
+                x = self.fixed_traces[str(button)][0]
+                y = self.fixed_traces[str(button)][1]
+                self.spectraPlotWidget.plot(x, y, pen=pg.mkPen(color, width=1))
+
+    def _list_fix_buttons(self) -> list:
+        buttons = []
+        for i in range(self.fixedTraces_vlay.count()):
+            item = self.fixedTraces_vlay.itemAt(i)
+            widget = item.widget()
+            if isinstance(widget, QPushButton) and widget.isCheckable():
+                buttons.append(widget)
+        return buttons
+
+    def set_theme(self, theme: str):
+        """
+        Aplica tema claro/escuro para widgets Qt e gráficos pyqtgraph.
+        """
+        if theme not in ('light', 'dark'):
+            return
+
+        self.theme = theme
+        if theme == 'dark':
+            self.theme_colors = {
+                'plot_bg': '#0b1220',
+                'axis': '#e5e7eb',
+                'roi_spec': '#64a5fa3c',
+                'roi_temp': '#4bdca037',
+                'spectrum': '#19867d',
+                'accent': "#961313",}
+        else:
+            self.theme_colors = {
+                'plot_bg': '#ffffffff',
+                'axis': '#1f2937',
+                'roi_spec': '#2864eb32',
+                'roi_temp': '#19a04b2d',
+                'spectrum': '#17bdaf',
+                'accent': '#961313',}
+
+        self.actionLight.setChecked(theme == 'light')
+        self.actionDark.setChecked(theme == 'dark')
+
+        QApplication.instance().setStyleSheet(qdarktheme.load_stylesheet(theme))
+
+        btn_colors =         [QColor(139, 0, 0),
+                              QColor(0, 152, 0),
+                              QColor(0, 0, 188),
+                              QColor(255, 170, 0),
+                              QColor(4, 150, 143),
+                              QColor(144, 1, 124),]
+        btn_colors_checked = [QColor(139, 50, 50),
+                              QColor(90, 152, 90),
+                              QColor(70, 70, 188),
+                              QColor(200, 169, 106),
+                              QColor(109, 150, 148),
+                              QColor(119, 66, 124),]
+        
+        for i, button in enumerate((self._list_fix_buttons())):
+            if i > len(btn_colors) - 1:
+                break
+            color = btn_colors[i]
+            color_chk = btn_colors_checked[i]
+            button.setStyleSheet(
+                f"""QPushButton {{background-color: rgb({color_chk.red()}, {color_chk.green()}, {color_chk.blue()}); color: lightgray;}}
+                QPushButton:checked {{background-color: rgb({color.red()}, {color.green()}, {color.blue()}); color: white;}}""")
+
+        for widget in (self.spectraPlotWidget, self.temporalPlotWidget, self.boxPlotWidget):
+            widget.setBackground(self.theme_colors['plot_bg'])
+
+        for plot_widget in (self.spectraPlotWidget, self.temporalPlotWidget):
+            item = plot_widget.getPlotItem()
+            item.getAxis('left').setPen(pg.mkPen(self.theme_colors['axis']))
+            item.getAxis('left').setTextPen(pg.mkPen(self.theme_colors['axis']))
+            item.getAxis('bottom').setPen(pg.mkPen(self.theme_colors['axis']))
+            item.getAxis('bottom').setTextPen(pg.mkPen(self.theme_colors['axis']))
+
+        if self.roi_region:
+            self.roi_region.setBrush(self.theme_colors['roi_spec'])
+            self.temporal_roi_region.setBrush(self.theme_colors['roi_temp'])
+
+        if len(self.results_df['Timestamp']) > 0:
+            self._update_plots_with_results()
 
     def load_config(self, config: dict):
         """
@@ -151,6 +495,52 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         self.config_data = config
         self._run()
+        QApplication.instance().restoreOverrideCursor()
+
+    def unit_changed(self, unit: str):
+        """
+        Callback chamado quando a unidade do eixo X é alterada.
+        Atualiza os dados e os gráficos para refletir a nova unidade.
+        
+        """
+        old_unit = self.xUnit
+        if unit == old_unit:
+            return
+
+        old_to_m = self._unit_to_meter_factor(old_unit)
+        new_to_m = self._unit_to_meter_factor(unit)
+        scale_old_to_new = old_to_m / new_to_m
+
+        self.xUnit = unit
+        self.actionM.setChecked(unit == 'm')
+        self.actionUm.setChecked(unit == 'um')
+        self.actionNm.setChecked(unit == 'nm')
+        self.actionPm.setChecked(unit == 'pm')
+        self._set_spectrum_axis_unit()
+
+        # Mantém ROI proporcional ao trocar unidade do eixo X.
+        if self.roi_region is not None:
+            roi_min, roi_max = self.roi_region.getRegion()
+            new_roi = (roi_min * scale_old_to_new, roi_max * scale_old_to_new)
+            self.roi_region.setRegion(new_roi)
+            self.roi_range = [new_roi[0], new_roi[1]]
+
+        # Reescala espectro já exibido para evitar distorção visual até a próxima aquisição.
+        if self.spectra_data:
+            x_old, y_vals = zip(*self.spectra_data)
+            x_new = np.asarray(x_old, dtype=float) * scale_old_to_new
+            y_new = np.asarray(y_vals, dtype=float)
+            self.spectra_data = list(zip(x_new, y_new))
+            self._plot_spectrum_curve(x_new, y_new)
+
+        # Reescala espectros fixados para manter consistência com a unidade atual.
+        for btn, trace in list(self.fixed_traces.items()):
+            x_old, y_vals = trace
+            x_new = np.asarray(x_old, dtype=float) * scale_old_to_new
+            self.fixed_traces[btn] = (x_new, np.asarray(y_vals, dtype=float))
+
+        if self.results_df['Timestamp']:
+            self._update_plots_with_results()
 
     def _run(self):
         if self.thread is not None:
@@ -160,6 +550,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         inter = self.config_data.get('inter')
         path = self.config_data.get('path')
         ip = self.config_data.get('ip')
+        range = self.config_data.get('range')
+        res = self.config_data.get('res')
+        self.fixed_wavelengths = np.arange(range[0], range[1], res) # Atualiza os comprimentos de onda fixos para interpolação
 
         if path != "None":
             logger.info(f"Carregando dados a partir do arquivo: {path}")
@@ -173,10 +566,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         if self.osa is None:
             match inter:
                 case 'THORLABS CCT11':
-                    from pyCCT import PyCCT
+                    from sdk.pyCCT import PyCCT
                     self.osa = PyCCT()
                 case 'THORLABS OSA203':
-                    import pyOSA
+                    from sdk.pyOSA import pyOSA
                     self.osa = pyOSA.initialize()
 
         # Inicia a thread de aquisição de dados
@@ -194,8 +587,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         
         self.thread.start()
 
+        self._running = True
         self.save_btn.setEnabled(False) # Desabilita o botão de salvar durante a aquisição
         self.stop_btn.setText("Parar")
+        self.stop_btn.setStyleSheet("QPushButton { background-color: #fd4d4d; color: white; }")
         self._is_stopping = False
         self.cfg_spin.setEnabled(False) # Desabilita o controle de tempo de exposição
         self.cfg_lbl.setEnabled(False)
@@ -218,7 +613,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         # Configura o timer para solicitar dados periodicamente
         self.timer = QTimer(self)
-        self.timer.timeout.connect(lambda: self.request_data_signal.emit(float(self.cfg_spin.value())))
+        self.timer.timeout.connect(lambda: self.request_data_signal.emit(
+                                                self.mean_samples, int(self.cfg_spin.value())))
         self.timer.start(self.sample_rate)
 
         match self.config_data.get('inter'):
@@ -227,13 +623,15 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.cfg_spin.setRange(3, 65535) # Limita o tempo de exposição
                 self.cfg_spin.setSingleStep(100)
             case 'BRAGGMETER FS22DI':
-                self.cfg_lbl.setText("Canal")
+                self.cfg_lbl.setText("Canal (0-3)")
                 self.cfg_spin.setRange(2, 3) # Canais de transmissão do BraggMeter
                 self.exposure_time = -1 # Desabilita a alteração do tempo de exposição
+                self.mean_btn.setEnabled(False) # TEMPORÁRIO
             case 'BRAGGMETER FS22DI HBM':
-                self.cfg_lbl.setText("Canal")
+                self.cfg_lbl.setText("Canal (0-3)")
                 self.cfg_spin.setRange(2, 3) # Canais de transmissão do BraggMeter HBM
                 self.exposure_time = -1 # Desabilita a alteração do tempo de exposição
+                self.mean_btn.setEnabled(False) # TEMPORÁRIO
             case 'THORLABS CCT11':
                 self.cfg_lbl.setText("Tempo de Exposição (ms)")
                 self.cfg_spin.setRange(1, 30000) # Limita o tempo de exposição
@@ -263,6 +661,68 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         except Exception:
             pass
 
+    def _show_warning(self, message: str):
+        """
+        Mostra uma caixa de diálogo de aviso de forma não-bloqueante.
+        
+        """
+        if message and self.warning_btn is None:            
+            # Cria um novo botão de aviso
+            self.warning_btn = QPushButton()
+            self.warning_hlay.addWidget(self.warning_btn)
+            cur_dir = os.path.dirname(__file__)
+            icon = os.path.join(cur_dir, "img", "warning.png")
+            self.warning_btn.setIcon(QIcon(icon))
+            
+            # Conexão com lambda para evitar múltiplas conexões
+            self.warning_btn.clicked.connect(lambda: QMessageBox.warning(self, "Aviso", message))
+            
+            # Mostra a caixa de diálogo
+            QMessageBox.warning(self, "Aviso", message)
+        elif self.warning_btn is not None:
+            # Remove o botão de aviso se não houver mensagem
+            self.warning_hlay.removeWidget(self.warning_btn)
+            self.warning_btn.clicked.disconnect()
+            self.warning_btn.deleteLater()
+            self.warning_btn = None
+
+    def _update_fixed_list(self, button: QPushButton):
+        del self.fixed_traces[str(button)]
+        if button.isChecked():
+            button.setChecked(False)
+            if not self._running:
+                x_vals, y_vals = zip(*self.spectra_data)
+                self._plot_spectrum_curve(np.asarray(x_vals, dtype=float), np.asarray(y_vals, dtype=float)) # Redesenha o espectro atual para limpar as curvas fixadas
+
+    def toggle_fix(self, button: QPushButton, pos):
+        menu = QMenu()
+
+        if str(button) in self.fixed_traces:
+            menu.addAction("Remover")
+            menu.triggered.connect(lambda: self._update_fixed_list(button))
+            menu.exec_(button.mapToGlobal(pos))
+
+    def fix_btn_clicked(self, button: QPushButton, checked: bool):
+        if str(button) in self.fixed_traces:
+            if not self._running:
+                if checked:
+                    x, y = self.fixed_traces[str(button)]
+                    color = button.palette().color(QPalette.ColorRole.Button)
+                    self.spectraPlotWidget.plot(x, y, pen=pg.mkPen(color, width=1))
+                else:
+                    x_vals, y_vals = zip(*self.spectra_data)
+                    self._plot_spectrum_curve(np.asarray(x_vals, dtype=float), np.asarray(y_vals, dtype=float)) # Redesenha o espectro atual para limpar as curvas fixadas
+            return
+        if checked:
+            if self.spectraPlotWidget.getPlotItem().listDataItems() == []:
+                button.setChecked(False) # Impede de marcar se não houver espectro para fixar
+                return
+            x, y = zip(*self.spectra_data)
+            self.fixed_traces[str(button)] = ((x, y))
+            if not self._running:
+                color = button.palette().color(QPalette.ColorRole.Button)
+                self.spectraPlotWidget.plot(x, y, pen=pg.mkPen(color, width=1))
+            
     def _cleanup_thread(self):
         """
         Limpa e finaliza a thread de aquisição de dados.
@@ -331,14 +791,17 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self.worker = None
             
         self._is_stopping = False
+        self._running = False
         self.save_btn.setEnabled(True)
         self.stop_btn.setText("Retomar")
+        self.stop_btn.setStyleSheet("QPushButton { background-color: #60fa93; color: #0f172a; }")
         self.sr_spin.setEnabled(True) # Habilita o controle de intervalo entre amostras
         self.sr_lbl.setEnabled(True)
         if self.config_data.get('inter') != 'THORLABS OSA203':
             self.cfg_spin.setEnabled(True) # Habilita o controle de tempo de exposição
             self.cfg_lbl.setEnabled(True)
         self.continuous_chk.setEnabled(True)
+        QApplication.instance().restoreOverrideCursor()
 
     def roi_changed(self):
         """
@@ -354,6 +817,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         Inicia ou para a thread de aquisição de dados com lógica de toggle.
         
         """
+        QApplication.instance().setOverrideCursor(Qt.WaitCursor)
         if self.continuous_timer is not None:
             self._flush_continuous_buffer(force=True)
             self._cleanup_thread()
@@ -410,27 +874,23 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         except Exception as e:
             logger.error(f"Erro ao salvar buffer contínuo: {e}")
 
-    def update_plot(self, data):
+    def update_plot(self, data, warning):
         """
         Atualiza o gráfico com os dados adquiridos.
         
         """
+        QApplication.instance().restoreOverrideCursor()
+        self._show_warning(warning)
+        
         x, y = zip(*data)
         x = np.asarray(x, dtype=float)
         y = np.asarray(y, dtype=float)
         # Converte de nm para a unidade configurada, caso necessário
-        match self.config_data.get('x_unit'):
-            case 'um':
-                x *= 1e-3
-                self.spectraPlotWidget.setLabel('bottom', units='μm')
-            case 'm':
-                x *= 1e-9
-                self.spectraPlotWidget.setLabel('bottom', units='m')
+        x *= self._unit_to_meter_factor('nm') / self._unit_to_meter_factor(self.xUnit)
+        self._set_spectrum_axis_unit()
 
         self.spectra_data = list(zip(x, y))
-        self.spectraPlotWidget.clear()
-        self.spectraPlotWidget.addItem(self.roi_region)
-        self.spectraPlotWidget.plot(x, y, pen=pg.mkPen('b', width=1)) # Plota apenas valores positivos de x e y
+        self._plot_spectrum_curve(x, y)
 
         if self.roi_range is None:
             x_min = min(x)
@@ -461,13 +921,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         power = np.asarray(power, dtype=float)
 
         # Wavelength em metros para o processamento
-        roi_m_min = roi_min * 1e-9
-        roi_m_max = roi_max * 1e-9
-        match self.config_data.get('x_unit'):
-            case 'nm':
-                wavelength *= 1e-9
-            case 'um':
-                wavelength *= 1e-6
+        display_to_m = self._unit_to_meter_factor(self.xUnit)
+        roi_m_min = roi_min * display_to_m
+        roi_m_max = roi_max * display_to_m
+        wavelength *= display_to_m
 
         # 3. Chama a função do backend para encontrar o pico
         res_wl = find_resonant_wavelength(np.array(wavelength), np.array(power), roi_m_min, roi_m_max)
@@ -478,11 +935,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             if len(self.results_df['Timestamp']) == 1:
                  self.spectraPlotWidget.autoRange() # Ajusta o gráfico na primeira medição
             now = datetime.now().timestamp()
-            inter = self.config_data.get('inter')
-            fixed_wavelengths = self.fixed_wavelengths.get(inter)
-            if fixed_wavelengths is None:
-                logger.warning(f"Interface desconhecida para interpolação: {inter}")
-                return
 
             interp_fn = interp1d(
                 wavelength,
@@ -491,7 +943,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 bounds_error=False,
                 fill_value=(power[0], power[-1])
             )
-            intensities = np.asarray(interp_fn(fixed_wavelengths), dtype=np.float32)
+            intensities = np.asarray(interp_fn(self.fixed_wavelengths), dtype=np.float32)
 
             self.results_df['Timestamp'].append(now)
             self.results_df['Intensidade'].append(intensities)
@@ -528,64 +980,68 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         sample_name: str,
     ):
         """
-        Acrescenta registros no arquivo HDF5 no grupo da interface selecionada.
+        Acrescenta registros no arquivo HDF5 usando o schema:
+        inter/param/sample_name/{Intensidades,Timestamp,ComprimentoRessonante}
         """
+        range_cfg = self.config_data.get('range')
+        res = self.config_data.get('res')
+        param = f"{int(range_cfg[0]*1e9)}-{int(range_cfg[1]*1e9)},{res*1e12:.1f}" # nm, nm, pm
+        spec_len = intensities.shape[1]
+
         with h5py.File(file_path, "a") as f:
             if inter not in f:
-                g = f.create_group(inter)
-                spec_len = intensities.shape[1]
+                f.create_group(inter)
+            if param not in f[inter]:
+                f[inter].create_group(param)
+            if sample_name not in f[inter][param]:
+                f[inter][param].create_group(sample_name)
+            s = f[inter][param][sample_name]
 
-                g.create_dataset(
+            if "Intensidades" not in s:
+                s.create_dataset(
                     "Intensidades",
-                    data=intensities,
+                    data=np.asarray(intensities, dtype=np.float32),
                     maxshape=(None, spec_len),
                     dtype="float32",
                     chunks=(256, spec_len),
                     compression="gzip"
                 )
-
-                g.create_dataset(
+                s.create_dataset(
                     "Timestamp",
-                    data=timestamps,
+                    data=np.asarray(timestamps, dtype=np.float64),
                     maxshape=(None,),
                     dtype="float64",
                     chunks=True
                 )
-
-                g.create_dataset(
+                s.create_dataset(
                     "ComprimentoRessonante",
-                    data=resonant_wavelengths,
+                    data=np.asarray(resonant_wavelengths, dtype=np.float64),
                     maxshape=(None,),
                     dtype="float64",
-                    chunks=True
-                )
-
-                g.create_dataset(
-                    "Amostra",
-                    data=np.asarray([sample_name.encode()] * len(timestamps), dtype="S64"),
-                    maxshape=(None,),
                     chunks=True
                 )
                 return
 
-            g = f[inter]
-            intensities_ds = g["Intensidades"]
-            timestamps_ds = g["Timestamp"]
-            wavelengths_ds = g["ComprimentoRessonante"]
-            samples_ds = g["Amostra"]
+            intensities_ds = s["Intensidades"]
+            timestamps_ds = s["Timestamp"]
+            wavelengths_ds = s["ComprimentoRessonante"]
+
+            if intensities_ds.shape[1] != spec_len:
+                raise ValueError(
+                    f"Comprimento do espectro incompatível para append. "
+                    f"Esperado {intensities_ds.shape[1]}, recebido {spec_len}."
+                )
 
             n_old = intensities_ds.shape[0]
             n_new = len(timestamps)
 
-            intensities_ds.resize((n_old + n_new, intensities_ds.shape[1]))
+            intensities_ds.resize((n_old + n_new, spec_len))
             timestamps_ds.resize((n_old + n_new,))
             wavelengths_ds.resize((n_old + n_new,))
-            samples_ds.resize((n_old + n_new,))
 
             intensities_ds[n_old:n_old+n_new] = np.asarray(intensities, dtype=np.float32)
             timestamps_ds[n_old:n_old+n_new] = np.asarray(timestamps, dtype=np.float64)
             wavelengths_ds[n_old:n_old+n_new] = np.asarray(resonant_wavelengths, dtype=np.float64)
-            samples_ds[n_old:n_old+n_new] = np.asarray([sample_name.encode()] * n_new, dtype="S64")
     
     def _update_plots_with_results(self):
         """
@@ -604,23 +1060,17 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # pyqtgraph precisa de timestamps numéricos (Unix timestamp) para o eixo de datas
         timestamps_numeric = self.results_df['Timestamp']
 
-        resonant_wavelengths = list(self.results_df['ComprimentoRessonante'])
-
-        # converte novamente para a escala configurada
-        match self.config_data.get('x_unit'):
-            case 'nm':
-                resonant_wavelengths = [i * 1e9 for i in resonant_wavelengths]
-            case 'um':
-                resonant_wavelengths = [i * 1e6 for i in resonant_wavelengths]
-        resonant_wavelengths = np.array(resonant_wavelengths, dtype=float)
+        resonant_wavelengths_m = np.asarray(self.results_df['ComprimentoRessonante'], dtype=float)
+        resonant_temporal = self._from_meter(resonant_wavelengths_m, self.resultUnit)
+        resonant_spectrum = self._from_meter(resonant_wavelengths_m, self.xUnit)
         
         # Plota os pontos e uma linha conectando-os
         self.temporalPlotWidget.plot(
             x=timestamps_numeric,
-            y=resonant_wavelengths,
-            pen={'color': 'b', 'width': 2},
+            y=resonant_temporal,
+            pen={'color': self.theme_colors['spectrum'], 'width': 2},
             symbol='o',
-            symbolBrush='r',
+            symbolBrush=self.theme_colors['accent'],
             symbolSize=8
         )
 
@@ -641,14 +1091,19 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.spectraPlotWidget.removeItem(item)
 
         # Adiciona uma linha vertical para o último pico encontrado
-        line = pg.InfiniteLine(pos=resonant_wavelengths[-1], angle=90, movable=False, pen={'color': 'r', 'style': pg.QtCore.Qt.DashLine})
+        line = pg.InfiniteLine(
+            pos=resonant_spectrum[-1],
+            angle=90,
+            movable=False,
+            pen={'color': self.theme_colors['accent'], 'style': pg.QtCore.Qt.DashLine}
+        )
         self.spectraPlotWidget.addItem(line)
         logger.debug(f"Marcador de pico adicionado ao gráfico de espectros.")
         
         # Seleciona a ROI temporal atual para filtrar os dados computados pelo box plot
         roi_min_ts, roi_max_ts = self.temporal_roi_region.getRegion()
         mask = [(r >= roi_min_ts) and (r <= roi_max_ts) for r in timestamps_numeric]
-        boxplot_resonant_wavelengths = [resonant_wavelengths[i] for i in range(len(resonant_wavelengths)) if mask[i]]
+        boxplot_resonant_wavelengths = [resonant_temporal[i] for i in range(len(resonant_temporal)) if mask[i]]
 
         if len(boxplot_resonant_wavelengths) == 0 and len(timestamps_numeric) > 0:
             logger.warning("ROI temporal vazia para box plot, nada a plotar.")
@@ -694,15 +1149,15 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     legend, f"{list(self.samples.keys())[i-1+loading] if i < len(self.samples.keys()) else 'Atual'}")
 
             # Linha da mediana
-            self.boxPlot.plot([0.75+i, 1.25+i], [q2, q2], pen=pg.mkPen('r', width=2))
+            self.boxPlot.plot([0.75+i, 1.25+i], [q2, q2], pen=pg.mkPen(self.theme_colors['accent'], width=2))
             #Linha vertical
             self.boxPlot.plot([1.0+i, 1.0+i], [q1, q3], pen='k')
             # Whiskers (linhas verticais dos limites)
             self.boxPlot.plot([1.0+i, 1.0+i], [q3, upper_whisker], pen='k')
             self.boxPlot.plot([1.0+i, 1.0+i], [q1, lower_whisker], pen='k')
             # Topo e base dos whiskers
-            self.boxPlot.plot([0.85+i, 1.15+i], [upper_whisker, upper_whisker], pen='b')
-            self.boxPlot.plot([0.85+i, 1.15+i], [lower_whisker, lower_whisker], pen='b')
+            self.boxPlot.plot([0.85+i, 1.15+i], [upper_whisker, upper_whisker], pen=pg.mkPen(self.theme_colors['spectrum']))
+            self.boxPlot.plot([0.85+i, 1.15+i], [lower_whisker, lower_whisker], pen=pg.mkPen(self.theme_colors['spectrum']))
 
             # Outliers (se existirem)
             if len(outliers) > 0:
@@ -711,7 +1166,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     outliers,
                     pen=None,
                     symbol='o',
-                    symbolBrush='r',
+                    symbolBrush=self.theme_colors['accent'],
                     symbolSize=5
                 )
         
@@ -747,16 +1202,13 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
     def clear_plot(self):
         """
-        Limpa todos os gráficos e os dados armazenados.
+        Limpa o gráfico do espectro e do plot temporal.
         """
         self.spectraPlotWidget.clear()
         self.spectraPlotWidget.addItem(self.roi_region)
         self.temporalPlotWidget.clear()
         self.temporalPlotWidget.addItem(self.temporal_roi_region)
         self.results_df = {'Timestamp': [], 'Intensidade': [], 'ComprimentoRessonante': []}
-        self.boxPlot.clear()
-        self.boxLegend.clear()
-        self._add_legend = True
         logger.info("Gráficos limpos.")
 
     def save_data(self):
@@ -785,17 +1237,21 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             return # Usuário cancelou a entrada do nome da amostra
 
         # --- Passo 3: Obtém o caminho do arquivo do usuário ---
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,   
-            "Salvar ou Anexar Resultados",
-            "",
-            "HDF5 Files (*.h5)",
-            options=QFileDialog.DontConfirmOverwrite
-        )
+        file_path = self.config_data.get('path')
+        if file_path != "None":
+            logger.info(f"Usando caminho de arquivo pré-configurado: {file_path}")
+        else:
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,   
+                "Salvar ou Anexar Experimento",
+                "",
+                "HDF5 Files (*.h5)",
+                options=QFileDialog.DontConfirmOverwrite
+            )
 
-        if not file_path:
-            logger.info("Operação de salvamento cancelada pelo usuário.")
-            return
+            if not file_path:
+                logger.info("Operação de salvamento cancelada pelo usuário.")
+                return
 
         # --- Passo 4: Processa e filtra os dados da ROI ---
         try:
@@ -835,13 +1291,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             logger.info(f"Dados salvos com sucesso em: {file_path}")
             QMessageBox.information(self, "Sucesso", f"{len(timestamps_filtered)} medições foram salvas com sucesso em:\n{file_path}")
 
+            # Armazena o caminho definido para futuro uso
+            self.config_data['path'] = file_path
+            self.setWindowTitle(f"Análise de dados - {os.path.basename(file_path)}")
             # Calcula e armazena as estatísticas do box plot na escala configurada
-            resonant_for_box = np.array(resonant_filtered, dtype=float)
-            match self.config_data.get('x_unit'):
-                case 'nm':
-                    resonant_for_box *= 1e9
-                case 'um':
-                    resonant_for_box *= 1e6
+            resonant_for_box = self._from_meter(resonant_filtered, self.resultUnit)
             self.samples[sample_name] = self.box_plot_statistics(resonant_for_box)
             self.samples = dict(reversed(self.samples.items())) # Mantém a ordem de inserção (última amostra salva aparece primeiro)
             self._add_legend = True
@@ -855,8 +1309,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
     def load_file(self, path: str):
         """
         Carrega dados de amostras de um arquivo HDF5 para análise.
-        O arquivo deve conter no grupo da interface os datasets
-        'ComprimentoRessonante' e 'Amostra'.
+        Formato esperado: inter/param/sample/{ComprimentoRessonante,...}
 
         Args:
             path (str): Caminho do arquivo HDF5 contendo os dados das amostras.
@@ -869,28 +1322,30 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     raise ValueError(f"Grupo '{inter}' não encontrado no arquivo.")
 
                 g = f[inter]
-                if "ComprimentoRessonante" not in g or "Amostra" not in g:
-                    raise ValueError("Datasets obrigatórios ausentes: 'ComprimentoRessonante' e/ou 'Amostra'.")
+                grouped_samples = {}
 
-                wavelengths = np.asarray(g["ComprimentoRessonante"][:], dtype=float)
-                sample_names = [
-                    s.decode() if isinstance(s, (bytes, np.bytes_)) else str(s)
-                    for s in g["Amostra"][:]
-                ]
+                # Formato novo: interface -> parâmetros -> amostra -> datasets
+                for param_name, param_group in g.items():
+                    if not isinstance(param_group, h5py.Group):
+                        continue
+                    for sample_name, sample_group in param_group.items():
+                        if not isinstance(sample_group, h5py.Group):
+                            continue
+                        if "ComprimentoRessonante" not in sample_group:
+                            continue
 
-            grouped_samples = {}
-            for idx, sample_name in enumerate(sample_names):
-                grouped_samples.setdefault(sample_name, []).append(wavelengths[idx])
+                        sample_wavelengths = np.asarray(
+                            sample_group["ComprimentoRessonante"][:],
+                            dtype=float
+                        )
+                        if len(sample_wavelengths) == 0:
+                            continue
+                        grouped_samples.setdefault(sample_name, []).extend(sample_wavelengths.tolist())
 
             last_wavelengths = []
             for sample_name, sample_wavelengths in grouped_samples.items():
                 sample_wavelengths = np.asarray(sample_wavelengths, dtype=float)
-
-                match self.config_data.get('x_unit'):
-                    case 'nm':
-                        sample_wavelengths *= 1e9
-                    case 'um':
-                        sample_wavelengths *= 1e6
+                sample_wavelengths = self._from_meter(sample_wavelengths, self.resultUnit)
 
                 self.samples[sample_name] = self.box_plot_statistics(sample_wavelengths)
                 last_wavelengths = sample_wavelengths
@@ -927,7 +1382,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # Obtém o caminho do arquivo do usuário ---
         file_path, _ = QFileDialog.getSaveFileName(
             self,   
-            "Salvar ou Anexar Resultados",
+            "Salvar ou Anexar Experimento",
             "",
             "HDF5 Files (*.h5)",
             options=QFileDialog.DontConfirmOverwrite
@@ -942,8 +1397,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         dialog.setInputMode(QInputDialog.IntInput)
         dialog.setWindowTitle("Duração da Amostra")
         dialog.setLabelText("Insira a duração da amostra em segundos:")
-        dialog.setIntValue(5*self.sample_rate//1000)
-        dialog.setIntMinimum(5*self.sample_rate//1000)
+        dialog.setIntValue(2*self.sample_rate//1000)
+        dialog.setIntMinimum(2*self.sample_rate//1000)
         dialog.setIntMaximum(24*3600)
         dialog.setIntStep(1)
         dialog.setOkButtonText("Iniciar")
@@ -976,8 +1431,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         Sobrescreve o evento de fechar a janela.
 
         Em vez de fechar a aplicação, esta função emite um sinal 'closing'
-        para que a janela principal possa reaparecer.
+        para que a janela de configuração possa reaparecer.
         
         """
         self._cleanup_thread()
         super().closeEvent(event)
+        self.closing.emit()

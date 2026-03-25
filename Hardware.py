@@ -17,7 +17,6 @@ import logging
 import socket
 import serial
 import time
-from scipy.signal import savgol_filter
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +40,7 @@ class BraggMeter:
 
     """
 
-    def __init__(self, host='10.0.0.150', port:int=3500, legacy_cmds=False):
+    def __init__(self, host='10.0.0.150', port: int=3500, legacy_cmds=False):
         """
         Initializes a new instance of the BraggMeter class.
 
@@ -225,16 +224,17 @@ class BraggMeter:
                 loc = i + 1
         return int(resp[loc])
 
-    def get_osa_trace(self, channel=0):
+    def get_osa_trace(self, n_mean: int=1, channel: int=0):
         """
         Retrieves the OSA trace data from the specified channel.
 
         Args:
+            n_mean (int): The number of samples to average.
             channel (int): The channel number.
 
         Returns:
             numpy.ndarray: An array containing the wavelength and trace data.
-
+            str: An warning message if the spectrum is saturated, otherwise None.
         """
         resp = self.ask(f'trace{channel}')
         resp = resp.split(':')
@@ -249,13 +249,13 @@ class BraggMeter:
             trace = [int(hex_value, 16) for hex_value in hex_values]
             wl = np.array([float(x) for x in wl.split(',')])
         
+        warn = None if np.max(trace) == 4095 else "Optical connector saturated"
         trace = 10*np.log10(np.abs(trace)+1e-12)
-        trace = savgol_filter(trace, 101, 2)
         trace *= -1
 
         spec = np.stack((wl, trace), axis=1)
         spec = np.flipud(spec)
-        return spec
+        return spec, warn
 
     def get_peaks(self, channel):
         """
@@ -437,7 +437,7 @@ class Imon512:
             if self.serial_port is not None:
                 logger.debug(f'Closing existing connection on {self.port} before reopening.')
                 try:
-                    if hasattr(self.serial_port, 'is_open') and self.serial_port.is_open:
+                    if hasattr(self.serial_port, 'is_open'):
                         self.serial_port.close()
                 except (OSError, AttributeError):
                     pass # Ignora erros ao verificar/fechar porta
@@ -563,9 +563,12 @@ class Imon512:
         try:
             response = self.listen()
             logger.debug(f'Temp response: {response.decode()}')
-            temp = float(response.decode().split('\t')[-1].split('\r')[0])
-            
-            self.temp = temp
+            try:
+                temp = float(response.decode().split('\t')[-1].split('\r')[0])
+                self.temp = temp
+            except:
+                pass
+
             self.wl = (self.wl - self.tem_param[2] * temp - self.tem_param[2]) \
                       / (1 + self.tem_param[0] * temp + self.tem_param[1])
         except Exception as e:
@@ -581,6 +584,7 @@ class Imon512:
         
         Returns:
             numpy.ndarray: The spectrum data.
+            bool: Pixel count exceed the saturation threshold.
         """
         
         measurements = []
@@ -589,9 +593,7 @@ class Imon512:
         for i in range(0, n_mean):
             try:
                 # Verifica se a porta e seus objetos internos estão válidos
-                if (self.serial_port is not None and 
-                hasattr(self.serial_port, 'is_open') and
-                self.serial_port.is_open):
+                if (self.serial_port is not None and hasattr(self.serial_port, 'is_open')):
                     serialString = self.serial_port.read(size=2*510)
                 else:
                     logger.error('Serial port or internal objects became invalid during measurement')
@@ -603,30 +605,31 @@ class Imon512:
                 # Aguarda um pouco para garantir que a porta está estável
                 time.sleep(0.1)
                 serialString = self.serial_port.read(size=2*510)
-            values = self.bytes2adc(serialString, n=510)
+            values, warn = self.bytes2adc(serialString, n=510)
             measurements.append(values[1::])
         self.ask('esc')
         measurements = np.array(measurements)
         measurements = 10*np.log10(np.abs(measurements)+1e-12)
-        measurements = savgol_filter(measurements, 31, 2) # Suaviza o sinal para melhor detecção de picos
 
         if n_mean > 1:
             measurements = np.mean(measurements, axis=0)
         if return_spectrum:
             spectrum = np.stack((self.wl[1::], measurements), axis=1)
-            return np.flipud(spectrum)
+            return np.flipud(spectrum), warn
         else:
             return measurements
     
-    def get_osa_trace(self):
+    def get_osa_trace(self, n_mean: int=1, *args):
         """
         Retrieves the OSA trace data.
         
         Returns:
             numpy.ndarray: The OSA trace data.
+            str: An warning message if the spectrum is saturated, otherwise None.
         """
-        spec = self.measure(n_mean=10, return_spectrum=True)
-        return spec
+        spec, warn = self.measure(n_mean=n_mean, return_spectrum=True)
+        warn = None if not warn else "Pixel count exceed the saturation threshold."
+        return spec, warn
 
     @staticmethod
     def bytes2adc(streamed_bytes, n=512):
@@ -639,13 +642,15 @@ class Imon512:
         
         Returns:
             list: The ADC values.
+            bool: Pixel count exceed the saturation threshold.
         """
         values = []
         for i in range(0, 2*n, 2):
             v = int.from_bytes(streamed_bytes[i:i + 2], byteorder='little')
             values.append(v)
-        return values
-    
+        warn = np.max(values) > 60000
+        return values, warn
+
     def set_exposure_time(self, et: int):
         """
         Sets the exposure time of the Imon512 device.
@@ -694,23 +699,28 @@ class ThorLabsCCT:
         """
         self.device = None
 
-    def get_osa_trace(self):
+    def get_osa_trace(self, n_mean: int=1, *args):
         """
         Retrieves the OSA trace data from the Thorlabs Compact Spectrograph.
 
         Returns:
             numpy.ndarray: The OSA trace data.
+            str: An warning message if the spectrum is saturated, otherwise None.
 
         """
         if self.device is None:
             raise RuntimeError("Device not connected.")
 
         try:
+            err = not self.device.set_hardware_average(n_mean)
             resp = self.device.acquire_single_spectrum()
             wl, intensities, exp_meas, ave_meas = resp
-            intensities = savgol_filter(intensities, 101, 2, axis=0)
             spec = np.stack((wl, intensities), axis=1)
-            return spec
+
+            warn = None if not self.device.is_saturated() else "Spectrum is saturated."
+            if err:
+                warn = "Failed to set hardware average." if not warn else warn + " Failed to set hardware average."
+            return spec, warn
         except Exception as e:
             raise RuntimeError(f"Failed to acquire spectrum: {e}")
 
@@ -754,6 +764,7 @@ class ThorLabs:
 
     def __init__(self, osa):
         self.device = osa
+        self.warming_error = False
         try:
             self.device.setup(autogain=False)
         except Exception as e:
@@ -765,30 +776,38 @@ class ThorLabs:
         """
         self.osa = None
 
-    def get_osa_trace(self):
+    def get_osa_trace(self, n_mean: int=1, *args):
         """
         Retrieves the OSA trace data from the Thorlabs OSA 20X.
 
         Returns:
             numpy.ndarray: The OSA trace data.
-
+            str: An warning message if the spectrum has validity issues, otherwise None.
         """
         if self.device is None:
             raise RuntimeError("Device not connected.")
 
         try:
-            resp = self.device.acquire(apodization='None', y_unit="dBm", ignore_errors=["Reference Warmup"])
+            resp = self.device.acquire_continuous(number_of_acquisitions=n_mean, 
+                                                  apodization='None', y_unit="dBm", 
+                                                  ignore_errors=["Reference Warmup"])
             spectrum = resp[-1]["spectrum"]
 
             validity = spectrum.check_validity()
+            warn = None
             if not validity["ref_laser_locked"]:
-                raise RuntimeError("Reference laser is not locked")
-            
+                warn = "Reference laser not locked"
+            if not validity["interferogram_within_detector_range"]:
+                warn = "Interferogram is clipped" if not warn else warn + ", Interferogram is clipped"
+            if not validity["interferogram_is_linear"]:
+                warn = "Interferogram is non-linear" if not warn else warn + ", Interferogram is non-linear"
+            if not validity["autogain_satisfied"]: # Only available for OSA20X
+                warn = "Autogain was not finished adjusting" if not warn else warn + ", Autogain was not finished adjusting"
+
             wl = spectrum.get_x()
             intensities = spectrum.get_y()
-            intensities = savgol_filter(intensities, 101, 2, axis=0)
             spec = np.stack((wl, intensities), axis=1)
-            return spec
+            return spec, warn
         except Exception as e:
             raise RuntimeError(f"Failed to acquire spectrum: {e}")
 

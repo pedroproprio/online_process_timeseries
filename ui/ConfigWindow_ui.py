@@ -15,16 +15,17 @@ from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
     QFont, QFontDatabase, QGradient, QIcon,
     QImage, QKeySequence, QLinearGradient, QPainter,
     QPalette, QPixmap, QRadialGradient, QTransform)
-from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel,
-    QLayout, QLineEdit, QMainWindow, QPushButton,
-    QSizePolicy, QSpacerItem, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox, QHBoxLayout,
+    QLabel, QLayout, QLineEdit, QMainWindow,
+    QPushButton, QSizePolicy, QSpacerItem, QSpinBox,
+    QVBoxLayout, QWidget)
 
 class Ui_ConfigWindow(object):
     def setupUi(self, ConfigWindow):
         if not ConfigWindow.objectName():
             ConfigWindow.setObjectName(u"ConfigWindow")
         ConfigWindow.setWindowModality(Qt.WindowModality.NonModal)
-        ConfigWindow.resize(501, 228)
+        ConfigWindow.resize(501, 252)
         sizePolicy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
@@ -48,33 +49,32 @@ class Ui_ConfigWindow(object):
         self.main_hlay.setObjectName(u"main_hlay")
         self.labels_vlay = QVBoxLayout()
         self.labels_vlay.setObjectName(u"labels_vlay")
-        self.wave_lbl = QLabel(self.centralwidget)
-        self.wave_lbl.setObjectName(u"wave_lbl")
+        self.inter_lbl = QLabel(self.centralwidget)
+        self.inter_lbl.setObjectName(u"inter_lbl")
         sizePolicy1 = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         sizePolicy1.setHorizontalStretch(0)
         sizePolicy1.setVerticalStretch(0)
-        sizePolicy1.setHeightForWidth(self.wave_lbl.sizePolicy().hasHeightForWidth())
-        self.wave_lbl.setSizePolicy(sizePolicy1)
-        self.wave_lbl.setTextFormat(Qt.TextFormat.PlainText)
-        self.wave_lbl.setAlignment(Qt.AlignmentFlag.AlignLeading|Qt.AlignmentFlag.AlignLeft|Qt.AlignmentFlag.AlignVCenter)
-
-        self.labels_vlay.addWidget(self.wave_lbl)
-
-        self.inter_lbl = QLabel(self.centralwidget)
-        self.inter_lbl.setObjectName(u"inter_lbl")
         sizePolicy1.setHeightForWidth(self.inter_lbl.sizePolicy().hasHeightForWidth())
         self.inter_lbl.setSizePolicy(sizePolicy1)
         self.inter_lbl.setTextFormat(Qt.TextFormat.PlainText)
 
         self.labels_vlay.addWidget(self.inter_lbl)
 
-        self.com_lbl = QLabel(self.centralwidget)
-        self.com_lbl.setObjectName(u"com_lbl")
-        sizePolicy1.setHeightForWidth(self.com_lbl.sizePolicy().hasHeightForWidth())
-        self.com_lbl.setSizePolicy(sizePolicy1)
-        self.com_lbl.setTextFormat(Qt.TextFormat.PlainText)
+        self.range_lbl = QLabel(self.centralwidget)
+        self.range_lbl.setObjectName(u"range_lbl")
+        sizePolicy1.setHeightForWidth(self.range_lbl.sizePolicy().hasHeightForWidth())
+        self.range_lbl.setSizePolicy(sizePolicy1)
+        self.range_lbl.setTextFormat(Qt.TextFormat.PlainText)
 
-        self.labels_vlay.addWidget(self.com_lbl)
+        self.labels_vlay.addWidget(self.range_lbl)
+
+        self.res_lbl = QLabel(self.centralwidget)
+        self.res_lbl.setObjectName(u"res_lbl")
+        sizePolicy1.setHeightForWidth(self.res_lbl.sizePolicy().hasHeightForWidth())
+        self.res_lbl.setSizePolicy(sizePolicy1)
+        self.res_lbl.setTextFormat(Qt.TextFormat.PlainText)
+
+        self.labels_vlay.addWidget(self.res_lbl)
 
         self.ip_lbl = QLabel(self.centralwidget)
         self.ip_lbl.setObjectName(u"ip_lbl")
@@ -84,19 +84,19 @@ class Ui_ConfigWindow(object):
 
         self.labels_vlay.addWidget(self.ip_lbl)
 
+        self.com_lbl = QLabel(self.centralwidget)
+        self.com_lbl.setObjectName(u"com_lbl")
+        sizePolicy1.setHeightForWidth(self.com_lbl.sizePolicy().hasHeightForWidth())
+        self.com_lbl.setSizePolicy(sizePolicy1)
+        self.com_lbl.setTextFormat(Qt.TextFormat.PlainText)
+
+        self.labels_vlay.addWidget(self.com_lbl)
+
 
         self.main_hlay.addLayout(self.labels_vlay)
 
         self.combos_vlay = QVBoxLayout()
         self.combos_vlay.setObjectName(u"combos_vlay")
-        self.unit_combo = QComboBox(self.centralwidget)
-        self.unit_combo.setObjectName(u"unit_combo")
-        sizePolicy1.setHeightForWidth(self.unit_combo.sizePolicy().hasHeightForWidth())
-        self.unit_combo.setSizePolicy(sizePolicy1)
-        self.unit_combo.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
-
-        self.combos_vlay.addWidget(self.unit_combo)
-
         self.inter_combo = QComboBox(self.centralwidget)
         self.inter_combo.setObjectName(u"inter_combo")
         sizePolicy1.setHeightForWidth(self.inter_combo.sizePolicy().hasHeightForWidth())
@@ -107,29 +107,65 @@ class Ui_ConfigWindow(object):
 
         self.com_hlay = QHBoxLayout()
         self.com_hlay.setObjectName(u"com_hlay")
-        self.port_combo = QComboBox(self.centralwidget)
-        self.port_combo.setObjectName(u"port_combo")
-        self.port_combo.setEnabled(False)
-        sizePolicy1.setHeightForWidth(self.port_combo.sizePolicy().hasHeightForWidth())
-        self.port_combo.setSizePolicy(sizePolicy1)
-
-        self.com_hlay.addWidget(self.port_combo)
-
-        self.refresh_btn = QPushButton(self.centralwidget)
-        self.refresh_btn.setObjectName(u"refresh_btn")
-        sizePolicy2 = QSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Maximum)
+        self.minNm_spin = QSpinBox(self.centralwidget)
+        self.minNm_spin.setObjectName(u"minNm_spin")
+        sizePolicy2 = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         sizePolicy2.setHorizontalStretch(0)
         sizePolicy2.setVerticalStretch(0)
-        sizePolicy2.setHeightForWidth(self.refresh_btn.sizePolicy().hasHeightForWidth())
-        self.refresh_btn.setSizePolicy(sizePolicy2)
-        self.refresh_btn.setMinimumSize(QSize(0, 0))
-        icon1 = QIcon(QIcon.fromTheme(QIcon.ThemeIcon.SyncSynchronizing))
-        self.refresh_btn.setIcon(icon1)
+        sizePolicy2.setHeightForWidth(self.minNm_spin.sizePolicy().hasHeightForWidth())
+        self.minNm_spin.setSizePolicy(sizePolicy2)
+        self.minNm_spin.setSingleStep(50)
 
-        self.com_hlay.addWidget(self.refresh_btn)
+        self.com_hlay.addWidget(self.minNm_spin)
+
+        self.label_5 = QLabel(self.centralwidget)
+        self.label_5.setObjectName(u"label_5")
+        sizePolicy.setHeightForWidth(self.label_5.sizePolicy().hasHeightForWidth())
+        self.label_5.setSizePolicy(sizePolicy)
+        self.label_5.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignTrailing|Qt.AlignmentFlag.AlignVCenter)
+
+        self.com_hlay.addWidget(self.label_5)
+
+        self.maxNm_spin = QSpinBox(self.centralwidget)
+        self.maxNm_spin.setObjectName(u"maxNm_spin")
+        sizePolicy2.setHeightForWidth(self.maxNm_spin.sizePolicy().hasHeightForWidth())
+        self.maxNm_spin.setSizePolicy(sizePolicy2)
+        self.maxNm_spin.setSingleStep(50)
+
+        self.com_hlay.addWidget(self.maxNm_spin)
+
+        self.label_6 = QLabel(self.centralwidget)
+        self.label_6.setObjectName(u"label_6")
+
+        self.com_hlay.addWidget(self.label_6)
 
 
         self.combos_vlay.addLayout(self.com_hlay)
+
+        self.horizontalLayout = QHBoxLayout()
+        self.horizontalLayout.setObjectName(u"horizontalLayout")
+        self.resPm_spin = QDoubleSpinBox(self.centralwidget)
+        self.resPm_spin.setObjectName(u"resPm_spin")
+        self.resPm_spin.setLocale(QLocale(QLocale.English, QLocale.UnitedStates))
+        self.resPm_spin.setDecimals(1)
+        self.resPm_spin.setMinimum(1.000000000000000)
+        self.resPm_spin.setSingleStep(0.100000000000000)
+        self.resPm_spin.setValue(100.000000000000000)
+
+        self.horizontalLayout.addWidget(self.resPm_spin)
+
+        self.label_7 = QLabel(self.centralwidget)
+        self.label_7.setObjectName(u"label_7")
+        sizePolicy3 = QSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        sizePolicy3.setHorizontalStretch(0)
+        sizePolicy3.setVerticalStretch(0)
+        sizePolicy3.setHeightForWidth(self.label_7.sizePolicy().hasHeightForWidth())
+        self.label_7.setSizePolicy(sizePolicy3)
+
+        self.horizontalLayout.addWidget(self.label_7)
+
+
+        self.combos_vlay.addLayout(self.horizontalLayout)
 
         self.ip_lineEdit = QLineEdit(self.centralwidget)
         self.ip_lineEdit.setObjectName(u"ip_lineEdit")
@@ -142,6 +178,14 @@ class Ui_ConfigWindow(object):
         self.ip_lineEdit.setClearButtonEnabled(False)
 
         self.combos_vlay.addWidget(self.ip_lineEdit)
+
+        self.port_combo = QComboBox(self.centralwidget)
+        self.port_combo.setObjectName(u"port_combo")
+        self.port_combo.setEnabled(False)
+        sizePolicy1.setHeightForWidth(self.port_combo.sizePolicy().hasHeightForWidth())
+        self.port_combo.setSizePolicy(sizePolicy1)
+
+        self.combos_vlay.addWidget(self.port_combo)
 
 
         self.main_hlay.addLayout(self.combos_vlay)
@@ -178,11 +222,11 @@ class Ui_ConfigWindow(object):
 
         self.start_btn = QPushButton(self.centralwidget)
         self.start_btn.setObjectName(u"start_btn")
-        sizePolicy3 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        sizePolicy3.setHorizontalStretch(0)
-        sizePolicy3.setVerticalStretch(0)
-        sizePolicy3.setHeightForWidth(self.start_btn.sizePolicy().hasHeightForWidth())
-        self.start_btn.setSizePolicy(sizePolicy3)
+        sizePolicy4 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        sizePolicy4.setHorizontalStretch(0)
+        sizePolicy4.setVerticalStretch(0)
+        sizePolicy4.setHeightForWidth(self.start_btn.sizePolicy().hasHeightForWidth())
+        self.start_btn.setSizePolicy(sizePolicy4)
 
         self.iniciar_hlay.addWidget(self.start_btn)
 
@@ -202,12 +246,15 @@ class Ui_ConfigWindow(object):
 
     def retranslateUi(self, ConfigWindow):
         ConfigWindow.setWindowTitle(QCoreApplication.translate("ConfigWindow", u"Configura\u00e7\u00e3o inicial", None))
-        self.wave_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Unidade do comprimento de onda:", None))
         self.inter_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Interrogador:", None))
-        self.com_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Porta:", None))
+        self.range_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Intervalo do comprimento de onda:", None))
+        self.res_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Resolu\u00e7\u00e3o do comprimento de onda:", None))
         self.ip_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Endere\u00e7o IP:", None))
+        self.com_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Porta:", None))
         self.inter_combo.setCurrentText("")
-        self.refresh_btn.setText("")
+        self.label_5.setText(QCoreApplication.translate("ConfigWindow", u"-", None))
+        self.label_6.setText(QCoreApplication.translate("ConfigWindow", u"nm", None))
+        self.label_7.setText(QCoreApplication.translate("ConfigWindow", u"pm", None))
         self.ip_lineEdit.setText(QCoreApplication.translate("ConfigWindow", u"10.0.0.10", None))
         self.file_path_lbl.setText("")
         self.load_btn.setText(QCoreApplication.translate("ConfigWindow", u"Carregar arquivo", None))
