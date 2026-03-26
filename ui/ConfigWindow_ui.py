@@ -215,11 +215,6 @@ class Ui_ConfigWindow(object):
 
         self.iniciar_hlay.addItem(self.horizontalSpacer)
 
-        self.load_btn = QPushButton(self.centralwidget)
-        self.load_btn.setObjectName(u"load_btn")
-
-        self.iniciar_hlay.addWidget(self.load_btn)
-
         self.start_btn = QPushButton(self.centralwidget)
         self.start_btn.setObjectName(u"start_btn")
         sizePolicy4 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
@@ -257,7 +252,6 @@ class Ui_ConfigWindow(object):
         self.label_7.setText(QCoreApplication.translate("ConfigWindow", u"pm", None))
         self.ip_lineEdit.setText(QCoreApplication.translate("ConfigWindow", u"10.0.0.10", None))
         self.file_path_lbl.setText("")
-        self.load_btn.setText(QCoreApplication.translate("ConfigWindow", u"Carregar arquivo", None))
         self.start_btn.setText(QCoreApplication.translate("ConfigWindow", u"Iniciar an\u00e1lise", None))
     # retranslateUi
 

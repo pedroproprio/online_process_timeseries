@@ -30,7 +30,9 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         # instância seja aberta por vez.
         self.analysis_window: AnalysisWindow | None = None
         # Caminho do arquivo de dados selecionado pelo usuário.
-        self.file_path: str = "None"
+        self.file_path: str | None = None
+        # Instância compartilhada de PyCCT/OSA para evitar conflito de múltiplas instâncias
+        self.osa = None
 
         self.setup_connections()
         self.update_imon_port()
@@ -41,9 +43,9 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         """
         self.start_btn.clicked.connect(self.start_analysis)
         self.inter_combo.currentTextChanged.connect(self.set_port_options)
-        self.load_btn.clicked.connect(self.load_file)
         self.refreshTimer = QTimer(self)
         self.refreshTimer.timeout.connect(self.update_imon_port)
+        self.start_btn.setShortcut('Return') # Atalho do teclado
 
         self.inter_combo.addItems(['IBSEN IMON-512', 'BRAGGMETER FS22DI', 'BRAGGMETER FS22DI HBM', 'THORLABS CCT11', 'THORLABS OSA203'])
 
@@ -53,13 +55,24 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         """
         QApplication.instance().setOverrideCursor(Qt.WaitCursor)
 
+        inter = self.inter_combo.currentText()
+        if self.osa is None:
+            match inter:
+                case 'THORLABS CCT11':
+                    from sdk.pyCCT import PyCCT
+                    self.osa = PyCCT()
+                case 'THORLABS OSA203':
+                    from sdk.pyOSA import pyOSA
+                    self.osa = pyOSA.initialize()
+
         config = {
-            'inter': self.inter_combo.currentText(),
+            'inter': inter,
             'range': (self.minNm_spin.value()*1e-9, self.maxNm_spin.value()*1e-9),
             'res': self.resPm_spin.value()*1e-12,
             'port': self.port_combo.currentText(),
             'ip': self.ip_lineEdit.text(),
-            'path': self.file_path
+            'path': self.file_path,
+            'sdk': self.osa
         }
 
         for x in config.get('ip').split('.'):
@@ -76,59 +89,6 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
             self.analysis_window.load_config(config)
             self.analysis_window.show()
             self.hide()
-
-    def load_file(self):
-        """
-        Abre um diálogo para seleção de arquivo e armazena o caminho selecionado.
-        """
-        self.file_path_lbl.setText("")
-        file_dialog = QFileDialog(self, "Selecione o arquivo de dados", "*.h5")
-        file_dialog.setFileMode(QFileDialog.ExistingFile)
-        if file_dialog.exec():
-            selected_files = file_dialog.selectedFiles()
-            if selected_files:
-                self.file_path = selected_files[0]
-        else:
-            return # Usuário cancelou a seleção de arquivo
-
-        # Verifica se o arquivo selecionado é válido
-        try:
-            inter = self.inter_combo.currentText()
-            with h5py.File(self.file_path, "r") as f:
-                if inter not in f:
-                    QMessageBox.warning(
-                        self,
-                        "Arquivo inválido",
-                        f"O arquivo HDF5 não contém o grupo da interface selecionada: {inter}."
-                    )
-                    self.file_path = "None"
-                    return
-
-                g = f[inter]
-                is_new_valid = False
-                for _, param_group in g.items():
-                    if not isinstance(param_group, h5py.Group):
-                        continue
-                    for _, sample_group in param_group.items():
-                        if isinstance(sample_group, h5py.Group) and "ComprimentoRessonante" in sample_group:
-                            is_new_valid = True
-                            break
-                    if is_new_valid:
-                        break
-
-                if not is_new_valid:
-                    QMessageBox.warning(
-                        self,
-                        "Arquivo inválido",
-                        "O arquivo não está no formato esperado: interface/param/amostra/ComprimentoRessonante."
-                    )
-                    self.file_path = "None"
-                    return
-
-            self.file_path_lbl.setText(f"Arquivo carregado de: {self.file_path}")
-        except Exception as e:
-            self.file_path = "None"
-            QMessageBox.warning(self, "Arquivo inválido", f"Falha ao abrir arquivo HDF5: {e}")
 
     def on_analysis_window_closed(self):
         """

@@ -357,13 +357,6 @@
        </spacer>
       </item>
       <item>
-       <widget class="QPushButton" name="load_btn">
-        <property name="text">
-         <string>Carregar arquivo</string>
-        </property>
-       </widget>
-      </item>
-      <item>
        <widget class="QPushButton" name="start_btn">
         <property name="sizePolicy">
          <sizepolicy hsizetype="Preferred" vsizetype="Maximum">

@@ -1,4 +1,5 @@
-from PySide6.QtWidgets import QMainWindow, QFileDialog, QMessageBox, QGraphicsRectItem, QInputDialog, QDialog, QPushButton, QMenu, QApplication, QFormLayout, QSpinBox, QDialogButtonBox
+from PySide6.QtWidgets import (QMainWindow, QFileDialog, QMessageBox, QGraphicsRectItem, QInputDialog, 
+    QDialog, QPushButton, QMenu, QApplication, QFormLayout, QSpinBox, QDialogButtonBox, QLineEdit, QCompleter)
 from PySide6.QtGui import QColor, QLinearGradient, QBrush, QIcon, QPalette, QGradient
 from PySide6.QtCore import Signal, QThread, QTimer, Qt
 
@@ -6,7 +7,7 @@ from ui.AnalysisWindow_ui import Ui_AnalysisWindow
 from processing import find_resonant_wavelength
 from DataAcquisition import DataAcquisition
 
-from scipy.signal import windows, savgol_filter
+from scipy.signal import windows, savgol_filter, find_peaks
 from scipy.interpolate import interp1d
 from datetime import datetime
 import pyqtgraph as pg
@@ -56,7 +57,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # Comprimentos de onda fixos para interpolação (em metros)
         self.fixed_wavelengths: np.ndarray | None = None
         # Dicionário de listas para armazenar os resultados processados
-        self.results_df = {'Timestamp': [], 'Intensidade': [], 'ComprimentoRessonante': []}
+        self.results_df = {'Timestamp': [], 'Intensidade': [], 'Vale': []}
         # Dicionário com os dados das amostras para o box plot
         self.samples = {}
         # Tempo de exposição (µs)
@@ -74,7 +75,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # Timer para flush periódico dos dados no modo contínuo
         self.flush_timer: QTimer | None = None
         # Buffer para salvar em lote no modo contínuo
-        self.pending_hdf5 = {'Timestamp': [], 'Intensidade': [], 'ComprimentoRessonante': []}
+        self.pending_hdf5 = {'Timestamp': [], 'Intensidade': [], 'Vale': []}
         # Tamanho do lote para flush no modo contínuo
         self.flush_batch_size: int = 25
         # Intervalo para flush automático no modo contínuo (ms)
@@ -94,25 +95,31 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.warning_btn: QPushButton | None = None
         # Flag para indicar se a aquisiçao está ativa
         self._running: bool = False
+        # Caminho para o arquivo de dados selecionado pelo usuário
+        self.file_path: str | None = None
+        # Lista com as mensagens de erro recebidas
+        self.error_messages: list = []
+
         # Método de apodização aplicado no plot (None desabilita)
         self.apodization: str | None = None
         self.apodization_methods = {
-            'Tukey': lambda m: windows.tukey(m),
-            'Triangular': lambda m: windows.triang(m),
-            'Taylor': lambda m: windows.taylor(m),
-            'Parzen': lambda m: windows.parzen(m),
-            'Nuttall': lambda m: windows.nuttall(m),
-            'Lanczos': lambda m: windows.lanczos(m),
-            'Hann': lambda m: windows.hann(m),
-            'Hamming': lambda m: windows.hamming(m),
-            'Flat top': lambda m: windows.flattop(m),
-            'Cosine': lambda m: windows.cosine(m),
-            'Boxcar': lambda m: windows.boxcar(m),
-            'Bohman': lambda m: windows.bohman(m),
-            'Blackman-Harris 4-term': lambda m: windows.blackmanharris(m),
-            'Blackman': lambda m: windows.blackman(m),
-            'Bartlett': lambda m: windows.bartlett(m),
-            'Bartlett-Hann': lambda m: windows.barthann(m),
+            'Tukey': lambda m, *a: windows.tukey(m, sym=False),
+            'Triangular': lambda m, *a: windows.triang(m, sym=False),
+            'Taylor': lambda m, *a: windows.taylor(m, sym=False),
+            'Parzen': lambda m, *a: windows.parzen(m, sym=False),
+            'Nuttall': lambda m, *a: windows.nuttall(m, sym=False),
+            'Lanczos': lambda m, *a: windows.lanczos(m, sym=False),
+            'Hann': lambda m, *a: windows.hann(m, sym=False),
+            'Hamming': lambda m, *a: windows.hamming(m, sym=False),
+            'Gaussian': lambda m, std: windows.gaussian(m, std, sym=False),
+            'Flat top': lambda m, *a: windows.flattop(m, sym=False),
+            'Cosine': lambda m, *a: windows.cosine(m, sym=False),
+            'Boxcar': lambda m, *a: windows.boxcar(m, sym=False),
+            'Bohman': lambda m, *a: windows.bohman(m, sym=False),
+            'Blackman-Harris 4-term': lambda m, *a: windows.blackmanharris(m, sym=False),
+            'Blackman': lambda m, *a: windows.blackman(m, sym=False),
+            'Bartlett': lambda m, *a: windows.bartlett(m, sym=False),
+            'Bartlett-Hann': lambda m, *a: windows.barthann(m, sym=False),
         }
         # Parametros do filtro Savitzky-Golay aplicados no plot (None desabilita)
         self.savgol_window_points: int = 51
@@ -207,6 +214,21 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.actionLight.triggered.connect(lambda checked: checked and self.set_theme('light'))
         self.actionDark.triggered.connect(lambda checked: checked and self.set_theme('dark'))
         self.actionHelp.triggered.connect(lambda: webbrowser.open('https://github.com/pedroproprio/online_process_timeseries'))
+        self.actionOpenFile.triggered.connect(self.select_file)
+        self.actionNewWindow.triggered.connect(self.open_new_window)
+
+        # Conecta atalhos do teclado
+        self.actionOpenFile.setShortcut('Ctrl+A')
+        self.actionNewWindow.setShortcut('Ctrl+N')
+        self.stop_btn.setShortcut('Space')
+        self.clear_btn.setShortcut('Ctrl+L')
+        self.save_btn.setShortcut('Ctrl+S')
+        self.continuous_chk.setShortcut('Ctrl+M')
+        self.apodization_btn.setShortcut('A')
+        self.savgol_btn.setShortcut('S')
+        self.mean_btn.setShortcut('M')
+        for i, button in enumerate(self._list_fix_buttons()):
+            button.setShortcut(f'{i+1}') # Atalhos 1-6 para fixar espectros
 
     def _unit_to_meter_factor(self, unit: str) -> float:
         factors = {
@@ -261,7 +283,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             return y_values
 
         try:
-            window = method(y_values.size)
+            window = method(y_values.size, np.std(y_values))
             window /= np.mean(window)
             y_apodized = y_values * window
             return y_apodized
@@ -318,7 +340,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         value, accepted = QInputDialog.getInt(
             self,
             'Média espectral',
-            'Número de amostras:',
+            'Número de espectros:',
             self.mean_samples,
             1,
             1000,
@@ -382,13 +404,13 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
     def _plot_spectrum_curve(self, x_values: np.ndarray, y_values: np.ndarray):
         """
-        Plota o(s) espectro(s) e aplica preenchimento colorido para a faixa visível.
+        Plota o(s) espectro(s) e um preenchimento colorido para a faixa visível.
+        
         """
         self.spectraPlotWidget.clear()
         self.spectraPlotWidget.addItem(self.roi_region)
 
-        y_values = self._apodize_plot_data(y_values)
-        y_values = savgol_filter(y_values, self.savgol_window_points, self.savgol_polyorder)
+        y_values = self._preprocess_plot_data(y_values)
 
         brush = self._visible_spectrum_brush(x_values)
         plot_kwargs = {'pen': pg.mkPen(self.theme_colors['spectrum'], width=1),}
@@ -404,15 +426,20 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     continue
                 color = button.palette().color(QPalette.ColorRole.Button)
                 x = self.fixed_traces[str(button)][0]
-                y = self.fixed_traces[str(button)][1]
+                y = self._preprocess_plot_data(self.fixed_traces[str(button)][1])
                 self.spectraPlotWidget.plot(x, y, pen=pg.mkPen(color, width=1))
+
+    def _preprocess_plot_data(self, y_values: np.ndarray) -> np.ndarray:
+        y_values = self._apodize_plot_data(y_values)
+        y_values = savgol_filter(y_values, self.savgol_window_points, self.savgol_polyorder)
+        return y_values
 
     def _list_fix_buttons(self) -> list:
         buttons = []
         for i in range(self.fixedTraces_vlay.count()):
             item = self.fixedTraces_vlay.itemAt(i)
             widget = item.widget()
-            if isinstance(widget, QPushButton) and widget.isCheckable():
+            if isinstance(widget, QPushButton):
                 buttons.append(widget)
         return buttons
 
@@ -460,8 +487,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                               QColor(119, 66, 124),]
         
         for i, button in enumerate((self._list_fix_buttons())):
-            if i > len(btn_colors) - 1:
-                break
             color = btn_colors[i]
             color_chk = btn_colors_checked[i]
             button.setStyleSheet(
@@ -484,6 +509,14 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         if len(self.results_df['Timestamp']) > 0:
             self._update_plots_with_results()
+
+    def open_new_window(self):
+        self.file_path = None
+        self.samples.clear()
+        self.clear_plot()
+        self.boxPlot.clear()
+        self.boxLegend.clear()
+        self.setWindowTitle("Análise de dados")
 
     def load_config(self, config: dict):
         """
@@ -548,29 +581,18 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             
         port = self.config_data.get('port')
         inter = self.config_data.get('inter')
-        path = self.config_data.get('path')
         ip = self.config_data.get('ip')
         range = self.config_data.get('range')
         res = self.config_data.get('res')
         self.fixed_wavelengths = np.arange(range[0], range[1], res) # Atualiza os comprimentos de onda fixos para interpolação
-
-        if path != "None":
-            logger.info(f"Carregando dados a partir do arquivo: {path}")
-            self.load_file(path)
 
         if self.continuous_chk.isChecked():
             if not self.continuous_cfg():
                 return
 
         # Inicializa a instância compartilhada de PyCCT, se necessário
-        if self.osa is None:
-            match inter:
-                case 'THORLABS CCT11':
-                    from sdk.pyCCT import PyCCT
-                    self.osa = PyCCT()
-                case 'THORLABS OSA203':
-                    from sdk.pyOSA import pyOSA
-                    self.osa = pyOSA.initialize()
+        if self.osa is None and 'THORLABS' in inter:
+            self.osa = self.config_data.get('sdk')
 
         # Inicia a thread de aquisição de dados
         self.thread = QThread()
@@ -587,8 +609,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         
         self.thread.start()
 
+        if self.continuous_timer is not None:
+             self.continuous_timer.start(self.sample_duration * 1000)
+
         self._running = True
-        self.save_btn.setEnabled(False) # Desabilita o botão de salvar durante a aquisição
         self.stop_btn.setText("Parar")
         self.stop_btn.setStyleSheet("QPushButton { background-color: #fd4d4d; color: white; }")
         self._is_stopping = False
@@ -626,12 +650,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.cfg_lbl.setText("Canal (0-3)")
                 self.cfg_spin.setRange(2, 3) # Canais de transmissão do BraggMeter
                 self.exposure_time = -1 # Desabilita a alteração do tempo de exposição
-                self.mean_btn.setEnabled(False) # TEMPORÁRIO
             case 'BRAGGMETER FS22DI HBM':
                 self.cfg_lbl.setText("Canal (0-3)")
                 self.cfg_spin.setRange(2, 3) # Canais de transmissão do BraggMeter HBM
                 self.exposure_time = -1 # Desabilita a alteração do tempo de exposição
-                self.mean_btn.setEnabled(False) # TEMPORÁRIO
             case 'THORLABS CCT11':
                 self.cfg_lbl.setText("Tempo de Exposição (ms)")
                 self.cfg_spin.setRange(1, 30000) # Limita o tempo de exposição
@@ -666,19 +688,32 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         Mostra uma caixa de diálogo de aviso de forma não-bloqueante.
         
         """
-        if message and self.warning_btn is None:            
-            # Cria um novo botão de aviso
-            self.warning_btn = QPushButton()
-            self.warning_hlay.addWidget(self.warning_btn)
-            cur_dir = os.path.dirname(__file__)
-            icon = os.path.join(cur_dir, "img", "warning.png")
-            self.warning_btn.setIcon(QIcon(icon))
-            
-            # Conexão com lambda para evitar múltiplas conexões
-            self.warning_btn.clicked.connect(lambda: QMessageBox.warning(self, "Aviso", message))
-            
-            # Mostra a caixa de diálogo
-            QMessageBox.warning(self, "Aviso", message)
+        if message:
+            if self.warning_btn:
+                messages = [m.strip() for m in message.split(',') if m.strip()]
+                new_messages = []
+
+                for msg in messages:
+                    if msg not in self.error_messages:
+                        self.error_messages.append(msg)
+                        new_messages.append(msg)
+
+                if new_messages:
+                    if len(new_messages) == 1:
+                        QMessageBox.warning(self, "Aviso", new_messages[0])
+                    else:
+                        QMessageBox.warning(self, "Aviso", '\n'.join(new_messages))
+            else:
+                # Cria um novo botão de aviso
+                self.warning_btn = QPushButton()
+                self.warning_hlay.addWidget(self.warning_btn)
+                cur_dir = os.path.dirname(__file__)
+                icon = os.path.join(cur_dir, "img", "warning.png")
+                self.warning_btn.setIcon(QIcon(icon))
+
+            # Cria conexão com botão e atualiza mensagem a exibir
+                self.warning_btn.clicked.connect(lambda: QMessageBox.warning(self, "Aviso", message))
+
         elif self.warning_btn is not None:
             # Remove o botão de aviso se não houver mensagem
             self.warning_hlay.removeWidget(self.warning_btn)
@@ -692,7 +727,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             button.setChecked(False)
             if not self._running:
                 x_vals, y_vals = zip(*self.spectra_data)
-                self._plot_spectrum_curve(np.asarray(x_vals, dtype=float), np.asarray(y_vals, dtype=float)) # Redesenha o espectro atual para limpar as curvas fixadas
+                # Redesenha o espectro atual para limpar as curvas fixadas
+                self._plot_spectrum_curve(np.asarray(x_vals, dtype=float), np.asarray(y_vals, dtype=float))
 
     def toggle_fix(self, button: QPushButton, pos):
         menu = QMenu()
@@ -708,12 +744,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 if checked:
                     x, y = self.fixed_traces[str(button)]
                     color = button.palette().color(QPalette.ColorRole.Button)
-                    self.spectraPlotWidget.plot(x, y, pen=pg.mkPen(color, width=1))
+                    self.spectraPlotWidget.plot(x, self._preprocess_plot_data(y), pen=pg.mkPen(color, width=1))
                 else:
                     x_vals, y_vals = zip(*self.spectra_data)
-                    self._plot_spectrum_curve(np.asarray(x_vals, dtype=float), np.asarray(y_vals, dtype=float)) # Redesenha o espectro atual para limpar as curvas fixadas
-            return
-        if checked:
+                    # Redesenha o espectro atual para limpar as curvas fixadas
+                    self._plot_spectrum_curve(np.asarray(x_vals, dtype=float), np.asarray(y_vals, dtype=float))
+        elif checked:
             if self.spectraPlotWidget.getPlotItem().listDataItems() == []:
                 button.setChecked(False) # Impede de marcar se não houver espectro para fixar
                 return
@@ -721,7 +757,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self.fixed_traces[str(button)] = ((x, y))
             if not self._running:
                 color = button.palette().color(QPalette.ColorRole.Button)
-                self.spectraPlotWidget.plot(x, y, pen=pg.mkPen(color, width=1))
+                self.spectraPlotWidget.plot(x, self._preprocess_plot_data(y), pen=pg.mkPen(color, width=1))
             
     def _cleanup_thread(self):
         """
@@ -792,7 +828,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             
         self._is_stopping = False
         self._running = False
-        self.save_btn.setEnabled(True)
         self.stop_btn.setText("Retomar")
         self.stop_btn.setStyleSheet("QPushButton { background-color: #60fa93; color: #0f172a; }")
         self.sr_spin.setEnabled(True) # Habilita o controle de intervalo entre amostras
@@ -802,6 +837,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self.cfg_lbl.setEnabled(True)
         self.continuous_chk.setEnabled(True)
         QApplication.instance().restoreOverrideCursor()
+        self.stop_btn.setEnabled(True)
 
     def roi_changed(self):
         """
@@ -818,6 +854,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         
         """
         QApplication.instance().setOverrideCursor(Qt.WaitCursor)
+        self.stop_btn.setEnabled(False) # Evita múltiplos cliques durante a transição
         if self.continuous_timer is not None:
             self._flush_continuous_buffer(force=True)
             self._cleanup_thread()
@@ -858,7 +895,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
             intensities = np.asarray(self.pending_hdf5['Intensidade'], dtype=np.float32)
             timestamps = np.asarray(self.pending_hdf5['Timestamp'], dtype=np.float64)
-            resonant_wavelengths = np.asarray(self.pending_hdf5['ComprimentoRessonante'], dtype=np.float64)
+            resonant_wavelengths = np.asarray(self.pending_hdf5['Vale'], dtype=np.float64)
 
             self._append_hdf5_records(
                 file_path=file_path,
@@ -869,7 +906,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 sample_name=self.sample_name or "Atual"
             )
 
-            self.pending_hdf5 = {'Timestamp': [], 'Intensidade': [], 'ComprimentoRessonante': []}
+            self.pending_hdf5 = {'Timestamp': [], 'Intensidade': [], 'Vale': []}
             logger.debug(f"Flush contínuo realizado com {pending_count} registro(s).")
         except Exception as e:
             logger.error(f"Erro ao salvar buffer contínuo: {e}")
@@ -880,6 +917,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         
         """
         QApplication.instance().restoreOverrideCursor()
+        self.stop_btn.setEnabled(True)
         self._show_warning(warning)
         
         x, y = zip(*data)
@@ -891,6 +929,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         self.spectra_data = list(zip(x, y))
         self._plot_spectrum_curve(x, y)
+
+        # peak_indices = list(find_peaks(y,prominence=0.1*(np.max(y)-np.min(y)),width=200,distance=500)[0])
+        # print('\n')
+        # for i in peak_indices:
+        #     print(f'{y[i]}\n')
 
         if self.roi_range is None:
             x_min = min(x)
@@ -904,7 +947,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
     def process_spectra(self):
         """
-        Executa o algoritmo de detecção de picos para todos os espectros na ROI.
+        Executa o algoritmo de detecção de picos para o espectro na ROI.
         
         """
         if not self.spectra_data:
@@ -947,19 +990,19 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
             self.results_df['Timestamp'].append(now)
             self.results_df['Intensidade'].append(intensities)
-            self.results_df['ComprimentoRessonante'].append(res_wl)
+            self.results_df['Vale'].append(res_wl)
 
             # Mantém apenas parte do histórico em memória para evitar degradação da UI.
             if self.continuous_chk.isChecked() and len(self.results_df['Timestamp']) > self.max_live_points:
                 excess = len(self.results_df['Timestamp']) - self.max_live_points
                 self.results_df['Timestamp'] = self.results_df['Timestamp'][excess:]
                 self.results_df['Intensidade'] = self.results_df['Intensidade'][excess:]
-                self.results_df['ComprimentoRessonante'] = self.results_df['ComprimentoRessonante'][excess:]
+                self.results_df['Vale'] = self.results_df['Vale'][excess:]
 
             if self.continuous_chk.isChecked():
                 self.pending_hdf5['Timestamp'].append(now)
                 self.pending_hdf5['Intensidade'].append(intensities)
-                self.pending_hdf5['ComprimentoRessonante'].append(res_wl)
+                self.pending_hdf5['Vale'].append(res_wl)
                 self._flush_continuous_buffer()
 
                 logger.debug(f"Dado salvo automaticamente")
@@ -981,7 +1024,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
     ):
         """
         Acrescenta registros no arquivo HDF5 usando o schema:
-        inter/param/sample_name/{Intensidades,Timestamp,ComprimentoRessonante}
+        inter/param/sample_name/{Intensidades,Timestamp,Vale}
         """
         range_cfg = self.config_data.get('range')
         res = self.config_data.get('res')
@@ -1014,7 +1057,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     chunks=True
                 )
                 s.create_dataset(
-                    "ComprimentoRessonante",
+                    "Vale",
                     data=np.asarray(resonant_wavelengths, dtype=np.float64),
                     maxshape=(None,),
                     dtype="float64",
@@ -1024,7 +1067,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
             intensities_ds = s["Intensidades"]
             timestamps_ds = s["Timestamp"]
-            wavelengths_ds = s["ComprimentoRessonante"]
+            wavelengths_ds = s["Vale"]
 
             if intensities_ds.shape[1] != spec_len:
                 raise ValueError(
@@ -1060,7 +1103,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # pyqtgraph precisa de timestamps numéricos (Unix timestamp) para o eixo de datas
         timestamps_numeric = self.results_df['Timestamp']
 
-        resonant_wavelengths_m = np.asarray(self.results_df['ComprimentoRessonante'], dtype=float)
+        resonant_wavelengths_m = np.asarray(self.results_df['Vale'], dtype=float)
         resonant_temporal = self._from_meter(resonant_wavelengths_m, self.resultUnit)
         resonant_spectrum = self._from_meter(resonant_wavelengths_m, self.xUnit)
         
@@ -1208,8 +1251,33 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.spectraPlotWidget.addItem(self.roi_region)
         self.temporalPlotWidget.clear()
         self.temporalPlotWidget.addItem(self.temporal_roi_region)
-        self.results_df = {'Timestamp': [], 'Intensidade': [], 'ComprimentoRessonante': []}
+        self.results_df = {'Timestamp': [], 'Intensidade': [], 'Vale': []}
+        self.spectra_data.clear()
         logger.info("Gráficos limpos.")
+
+    def _prompt_sample_name(self) -> tuple[str, bool]:
+        """
+        Abre diálogo para entrada do nome da amostra com sugestões.
+
+        As sugestões são baseadas nas amostras já carregadas do arquivo aberto.
+        """
+        dialog = QInputDialog(self)
+        dialog.setInputMode(QInputDialog.TextInput)
+        dialog.setWindowTitle("Nome da Amostra")
+        dialog.setLabelText("Insira o nome da amostra para salvar os dados:")
+
+        line_edit = dialog.findChild(QLineEdit)
+        if line_edit is not None and self.samples:
+            completer = QCompleter(list(self.samples.keys()), dialog)
+            completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            completer.setCompletionMode(QCompleter.PopupCompletion)
+            completer.setFilterMode(Qt.MatchFlag.MatchContains)
+            line_edit.setCompleter(completer)
+
+        if dialog.exec() != QDialog.Accepted:
+            return "", False
+
+        return dialog.textValue(), True
 
     def save_data(self):
         """
@@ -1218,6 +1286,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         Os dados são filtrados pela ROI temporal antes de serem salvos.
         
         """
+        # Interrompe a aquisição de dados
+        if self._running:
+            self.toggle_thread()
+
         # --- Passo 1: Validação inicial ---
         if len(self.results_df['Timestamp']) == 0:
             logger.warning("Tentativa de salvar sem dados processados.")
@@ -1227,18 +1299,14 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         logger.info("Iniciando processo para salvar dados.")
 
         # --- Passo 2: Abre diálogo para inserir o nome da amostra ---
-        sample_name, ok = QInputDialog.getText(
-            self,
-            "Nome da Amostra",
-            "Insira o nome da amostra para salvar os dados:"
-        )
+        sample_name, ok = self._prompt_sample_name()
 
         if not ok:
             return # Usuário cancelou a entrada do nome da amostra
 
         # --- Passo 3: Obtém o caminho do arquivo do usuário ---
         file_path = self.config_data.get('path')
-        if file_path != "None":
+        if file_path is not None:
             logger.info(f"Usando caminho de arquivo pré-configurado: {file_path}")
         else:
             file_path, _ = QFileDialog.getSaveFileName(
@@ -1259,7 +1327,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
             timestamps = np.asarray(self.results_df['Timestamp'], dtype=np.float64)
             intensities = self.results_df['Intensidade']
-            resonant_wavelengths = np.asarray(self.results_df['ComprimentoRessonante'], dtype=np.float64)
+            resonant_wavelengths = np.asarray(self.results_df['Vale'], dtype=np.float64)
             
             mask = (timestamps >= roi_min_ts) & (timestamps <= roi_max_ts)
 
@@ -1292,7 +1360,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             QMessageBox.information(self, "Sucesso", f"{len(timestamps_filtered)} medições foram salvas com sucesso em:\n{file_path}")
 
             # Armazena o caminho definido para futuro uso
-            self.config_data['path'] = file_path
+            self.file_path = file_path
             self.setWindowTitle(f"Análise de dados - {os.path.basename(file_path)}")
             # Calcula e armazena as estatísticas do box plot na escala configurada
             resonant_for_box = self._from_meter(resonant_filtered, self.resultUnit)
@@ -1306,10 +1374,59 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             logger.error(f"Falha ao processar ou salvar os dados: {e}")
             QMessageBox.critical(self, "Erro", f"Ocorreu um erro ao salvar o arquivo:\n{e}")
 
+    def select_file(self):
+        """
+        Abre um diálogo para seleção de arquivo e armazena o caminho selecionado.
+        """
+        file_dialog = QFileDialog(self, "Selecione o arquivo de dados", filter="HDF5 Files (*.h5)")
+        file_dialog.setFileMode(QFileDialog.ExistingFile)
+        if file_dialog.exec():
+            selected_files = file_dialog.selectedFiles()
+            if selected_files:
+                path = selected_files[0]
+        else:
+            return # Usuário cancelou a seleção de arquivo
+
+        # Verifica se o arquivo selecionado é válido
+        try:
+            inter = self.config_data.get('inter')
+            with h5py.File(path, "r") as f:
+                if inter not in f:
+                    QMessageBox.warning(
+                        self,
+                        "Arquivo inválido",
+                        f"O arquivo HDF5 não contém o grupo da interface selecionada: {inter}."
+                    )
+                    return
+
+                g = f[inter]
+                is_new_valid = False
+                for _, param_group in g.items():
+                    if not isinstance(param_group, h5py.Group):
+                        continue
+                    for _, sample_group in param_group.items():
+                        if isinstance(sample_group, h5py.Group) and "Vale" in sample_group:
+                            is_new_valid = True
+                            break
+                    if is_new_valid:
+                        break
+
+                if not is_new_valid:
+                    QMessageBox.warning(
+                        self,
+                        "Arquivo inválido",
+                        "O arquivo não está no formato esperado."
+                    )
+                    return
+                self.load_file(path)
+
+        except Exception as e:
+            QMessageBox.warning(self, "Arquivo inválido", f"Falha ao abrir arquivo HDF5: {e}")
+
+
     def load_file(self, path: str):
         """
         Carrega dados de amostras de um arquivo HDF5 para análise.
-        Formato esperado: inter/param/sample/{ComprimentoRessonante,...}
 
         Args:
             path (str): Caminho do arquivo HDF5 contendo os dados das amostras.
@@ -1331,11 +1448,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     for sample_name, sample_group in param_group.items():
                         if not isinstance(sample_group, h5py.Group):
                             continue
-                        if "ComprimentoRessonante" not in sample_group:
+                        if "Vale" not in sample_group:
                             continue
 
                         sample_wavelengths = np.asarray(
-                            sample_group["ComprimentoRessonante"][:],
+                            sample_group["Vale"][:],
                             dtype=float
                         )
                         if len(sample_wavelengths) == 0:
@@ -1356,6 +1473,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self._add_legend = True
             self.boxLegend.clear()
             self.update_box_plot(last_wavelengths, loading=True) # Atualiza os gráficos com os box plots carregados
+            self.setWindowTitle(f"Análise de dados - {os.path.basename(path)}")
+            self.file_path = path
             logger.info(f"Dados carregados com sucesso do arquivo: {path}. {len(self.samples)} amostra(s) encontrada(s).")
 
         except Exception as e:
@@ -1370,11 +1489,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         
         """
         # Abre diálogo para inserir o nome da amostra ---
-        self.sample_name, ok = QInputDialog.getText(
-            self,
-            "Nome da Amostra",
-            "Insira o nome da amostra para salvar os dados:"
-        )
+        self.sample_name, ok = self._prompt_sample_name()
 
         if not ok:
             return False # Usuário cancelou a entrada do nome da amostra
@@ -1409,7 +1524,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             return False # Usuário cancelou a entrada da duração da amostra
         
         # Atualiza o caminho de salvamento para o modo contínuo
-        self.config_data['path'] = file_path
+        self.file_path = file_path
         logger.debug(f"Caminho de salvamento definido para o modo contínuo: {file_path}")
         
         self.clear_plot()
@@ -1419,11 +1534,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.continuous_timer.stop()
             self.continuous_timer.deleteLater()
 
-        self.pending_hdf5 = {'Timestamp': [], 'Intensidade': [], 'ComprimentoRessonante': []}
+        self.pending_hdf5 = {'Timestamp': [], 'Intensidade': [], 'Vale': []}
         self.continuous_timer = QTimer(self)
         self.continuous_timer.setSingleShot(True)
         self.continuous_timer.timeout.connect(self.continuous_timer_shot)
-        self.continuous_timer.start(self.sample_duration * 1000)
         return True
         
     def closeEvent(self, event):

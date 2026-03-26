@@ -236,22 +236,36 @@ class BraggMeter:
             numpy.ndarray: An array containing the wavelength and trace data.
             str: An warning message if the spectrum is saturated, otherwise None.
         """
-        resp = self.ask(f'trace{channel}')
-        resp = resp.split(':')
-        
-        if self.legacy_cmds:
-            pot = resp[-1]
-            trace = np.array([float(x) for x in pot.split(',')])
-            wl = np.linspace(1500, 1600, len(trace))
+        traces_db = []
+        wl = None
+        warn = None
+
+        for _ in range(n_mean):
+            resp = self.ask(f'trace{channel}')
+            resp = resp.split(':')
+
+            if self.legacy_cmds:
+                pot = resp[-1]
+                trace_raw = np.array([float(x) for x in pot.split(',')], dtype=float)
+                wl = np.linspace(1500, 1600, len(trace_raw))
+            else:
+                pot, wl_str = resp[-2], resp[-1]
+                hex_values = [pot[i:i+3] for i in range(0, len(pot), 3)]
+                trace_raw = np.array([int(hex_value, 16) for hex_value in hex_values], dtype=float)
+                wl = np.array([float(x) for x in wl_str.split(',')])
+
+            if np.max(trace_raw) == 4095:
+                warn = "Optical connector saturated."
+
+            trace_db = 10*np.log10(np.abs(trace_raw)+1e-12)
+            trace_db *= -1
+            traces_db.append(trace_db)
+
+        trace = np.array(traces_db)
+        if n_mean > 1:
+            trace = np.mean(trace, axis=0)
         else:
-            pot, wl = resp[-2], resp[-1]
-            hex_values = [pot[i:i+3] for i in range(0, len(pot), 3)]
-            trace = [int(hex_value, 16) for hex_value in hex_values]
-            wl = np.array([float(x) for x in wl.split(',')])
-        
-        warn = None if np.max(trace) == 4095 else "Optical connector saturated"
-        trace = 10*np.log10(np.abs(trace)+1e-12)
-        trace *= -1
+            trace = trace[0]
 
         spec = np.stack((wl, trace), axis=1)
         spec = np.flipud(spec)

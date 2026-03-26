@@ -11,7 +11,7 @@ from lib.PyQtDarkTheme import qdarktheme
 if __name__ == "__main__":
     app = QApplication(argv)
     app.setStyleSheet(qdarktheme.load_stylesheet())
-
+    
     window = ConfigWindow()
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     icon = os.path.join(cur_dir, "img", "logo.png")

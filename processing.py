@@ -8,7 +8,6 @@ gráfica, para analisar os espectros dos sensores.
 """
 
 import logging
-from typing import Optional
 import numpy as np
 from scipy.optimize import curve_fit
 
@@ -19,7 +18,7 @@ logger = logging.getLogger(__name__)
 def find_resonant_wavelength(wavelengths: np.ndarray,
                              power: np.ndarray,
                              roi_min: float,
-                             roi_max: float) -> Optional[float]:
+                             roi_max: float) -> float | None:
     """
     Encontra o comprimento de onda ressonante (mínimo de potência) em uma ROI.
 
@@ -30,7 +29,7 @@ def find_resonant_wavelength(wavelengths: np.ndarray,
         roi_max (float): Limite superior da Região de Interesse (ROI).
 
     Returns:
-        Optional[float]: O valor do comprimento de onda ressonante encontrado,
+        [float | None]: O valor do comprimento de onda ressonante encontrado,
                          ou None se nenhum dado estiver presente na ROI.
     """
     try:
