@@ -17,15 +17,15 @@ from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
     QPalette, QPixmap, QRadialGradient, QTransform)
 from PySide6.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox, QHBoxLayout,
     QLabel, QLayout, QLineEdit, QMainWindow,
-    QPushButton, QSizePolicy, QSpacerItem, QSpinBox,
-    QVBoxLayout, QWidget)
+    QPushButton, QRadioButton, QSizePolicy, QSpacerItem,
+    QSpinBox, QVBoxLayout, QWidget)
 
 class Ui_ConfigWindow(object):
     def setupUi(self, ConfigWindow):
         if not ConfigWindow.objectName():
             ConfigWindow.setObjectName(u"ConfigWindow")
         ConfigWindow.setWindowModality(Qt.WindowModality.NonModal)
-        ConfigWindow.resize(501, 252)
+        ConfigWindow.resize(569, 323)
         sizePolicy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
@@ -193,14 +193,52 @@ class Ui_ConfigWindow(object):
 
         self.verticalLayout.addLayout(self.main_hlay)
 
-        self.file_path_lbl = QLabel(self.centralwidget)
-        self.file_path_lbl.setObjectName(u"file_path_lbl")
-        self.file_path_lbl.setEnabled(False)
-        font = QFont()
-        font.setPointSize(8)
-        self.file_path_lbl.setFont(font)
+        self.verticalSpacer_2 = QSpacerItem(20, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
 
-        self.verticalLayout.addWidget(self.file_path_lbl)
+        self.verticalLayout.addItem(self.verticalSpacer_2)
+
+        self.ch_lbl = QLabel(self.centralwidget)
+        self.ch_lbl.setObjectName(u"ch_lbl")
+
+        self.verticalLayout.addWidget(self.ch_lbl)
+
+        self.horizontalLayout_3 = QHBoxLayout()
+        self.horizontalLayout_3.setObjectName(u"horizontalLayout_3")
+        self.ch1_radio = QRadioButton(self.centralwidget)
+        self.ch1_radio.setObjectName(u"ch1_radio")
+        sizePolicy3.setHeightForWidth(self.ch1_radio.sizePolicy().hasHeightForWidth())
+        self.ch1_radio.setSizePolicy(sizePolicy3)
+        self.ch1_radio.setChecked(True)
+        self.ch1_radio.setAutoExclusive(False)
+
+        self.horizontalLayout_3.addWidget(self.ch1_radio)
+
+        self.ch2_radio = QRadioButton(self.centralwidget)
+        self.ch2_radio.setObjectName(u"ch2_radio")
+        sizePolicy3.setHeightForWidth(self.ch2_radio.sizePolicy().hasHeightForWidth())
+        self.ch2_radio.setSizePolicy(sizePolicy3)
+        self.ch2_radio.setAutoExclusive(False)
+
+        self.horizontalLayout_3.addWidget(self.ch2_radio)
+
+        self.ch3_radio = QRadioButton(self.centralwidget)
+        self.ch3_radio.setObjectName(u"ch3_radio")
+        sizePolicy3.setHeightForWidth(self.ch3_radio.sizePolicy().hasHeightForWidth())
+        self.ch3_radio.setSizePolicy(sizePolicy3)
+        self.ch3_radio.setAutoExclusive(False)
+
+        self.horizontalLayout_3.addWidget(self.ch3_radio)
+
+        self.ch4_radio = QRadioButton(self.centralwidget)
+        self.ch4_radio.setObjectName(u"ch4_radio")
+        sizePolicy3.setHeightForWidth(self.ch4_radio.sizePolicy().hasHeightForWidth())
+        self.ch4_radio.setSizePolicy(sizePolicy3)
+        self.ch4_radio.setAutoExclusive(False)
+
+        self.horizontalLayout_3.addWidget(self.ch4_radio)
+
+
+        self.verticalLayout.addLayout(self.horizontalLayout_3)
 
         self.verticalSpacer = QSpacerItem(20, 40, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
 
@@ -251,7 +289,11 @@ class Ui_ConfigWindow(object):
         self.label_6.setText(QCoreApplication.translate("ConfigWindow", u"nm", None))
         self.label_7.setText(QCoreApplication.translate("ConfigWindow", u"pm", None))
         self.ip_lineEdit.setText(QCoreApplication.translate("ConfigWindow", u"10.0.0.10", None))
-        self.file_path_lbl.setText("")
+        self.ch_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Canais usados:", None))
+        self.ch1_radio.setText(QCoreApplication.translate("ConfigWindow", u"Canal 1", None))
+        self.ch2_radio.setText(QCoreApplication.translate("ConfigWindow", u"Canal 2", None))
+        self.ch3_radio.setText(QCoreApplication.translate("ConfigWindow", u"Canal 3", None))
+        self.ch4_radio.setText(QCoreApplication.translate("ConfigWindow", u"Canal 4", None))
         self.start_btn.setText(QCoreApplication.translate("ConfigWindow", u"Iniciar an\u00e1lise", None))
     # retranslateUi
 

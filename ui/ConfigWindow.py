@@ -1,0 +1,225 @@
+from PySide6.QtWidgets import QMainWindow, QMessageBox, QApplication
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QIcon
+
+from ui.ConfigWindow_ui import Ui_ConfigWindow
+from ui.AnalysisWindow import AnalysisWindow
+
+from serial.tools import list_ports
+from sys import argv
+import os
+
+class ConfigWindow(QMainWindow, Ui_ConfigWindow):
+    """
+    Janela de configuração para análise em tempo real de sensores LPG.
+
+    O usuário deve configurar:
+    - Modelo da interface.
+    - Intervalo do comprimento de onda a ser analisado e interpolado.
+    - Intervalo de resolução do comprimento de onda para interpolação.
+    - Parâmetros de comunicação (como porta serial ou TCP/IP).
+    - Canais a serem analisados (se aplicável).
+
+    """
+    def __init__(self):
+        super().__init__()
+
+        self.setupUi(self)
+        self.retranslateUi(self)
+
+        # --- Atributos da Classe ---
+        # Mantém uma referência à janela de análise para evitar que ela seja
+        # coletada pelo garbage collector e para garantir que apenas uma
+        # instância seja aberta por vez.
+        self.analysis_window: AnalysisWindow | None = None
+        # Caminho do arquivo de dados selecionado pelo usuário.
+        self.file_path: str | None = None
+        # Instância compartilhada de PyOSA para evitar conflito de múltiplas instâncias
+        self.pyosa = None
+        # Instância compartilhada de PyCCT para evitar conflito de múltiplas instâncias
+        self.pycct = None
+        # Portas dos switches Sercalo (se detectados) - pode haver múltiplos
+        self.switch_ports: list[str] = []
+
+        self.setup_connections()
+        self.update_coms()
+
+    def setup_connections(self):
+        """
+        Conecta os sinais dos widgets (eventos) aos seus respectivos slots (métodos).
+
+        """
+        self.start_btn.clicked.connect(self.start_analysis)
+        self.inter_combo.currentTextChanged.connect(self.set_port_options)
+        self.refreshTimer = QTimer(self)
+        self.refreshTimer.timeout.connect(self.update_coms)
+        self.refreshTimer.start(1000) # Atualiza as portas seriais a cada segundo
+        self.ch1_radio.toggled.connect(self.channel_toggled)
+        self.start_btn.setShortcut('Return') # Atalho do teclado
+
+        for ch in [self.ch1_radio, self.ch2_radio, self.ch3_radio, self.ch4_radio]:
+            ch.toggled.connect(self.channel_toggled)
+
+        self.inter_combo.addItems(['IBSEN IMON-512', 'BRAGGMETER FS22DI', 'BRAGGMETER FS22DI HBM', 'THORLABS CCT11', 'THORLABS OSA203'])
+
+    def start_analysis(self):
+        """
+        Inicia a janela de análise com as configurações selecionadas.
+
+        """
+        QApplication.instance().setOverrideCursor(Qt.WaitCursor)
+        cur_dir = os.path.dirname(os.path.abspath(argv[0]))
+
+        inter = self.inter_combo.currentText()
+        osa = None
+        try:
+            match inter:
+                case 'THORLABS CCT11':
+                    if self.pycct is None:
+                        from sdk.pyCCT import PyCCT
+                        dll_path = os.path.join(cur_dir, "sdk", "net48")
+                        self.pycct = PyCCT(dll_path)
+                    osa = self.pycct
+                case 'THORLABS OSA203':
+                    if self.pyosa is None:
+                        import sdk.pyOSA as pyOSA
+                        self.pyosa = pyOSA.initialize()
+                    osa = self.pyosa
+        except Exception as e:
+            QMessageBox.critical(self, "Erro ao inicializar OSA", f"Não foi possível inicializar o dispositivo OSA: {e}")
+            QApplication.instance().restoreOverrideCursor()
+            return
+
+        config = {
+            'inter': inter,
+            'range': (self.minNm_spin.value()*1e-9, self.maxNm_spin.value()*1e-9),
+            'res': self.resPm_spin.value()*1e-12,
+            'port': self.port_combo.currentText(),
+            'ip': self.ip_lineEdit.text(),
+            'path': self.file_path,
+            'sdk': osa,
+            'switch_ports': self.switch_ports,  # Lista de todas as portas de switch
+            'channels': (self.ch1_radio.isChecked(), self.ch2_radio.isChecked(), self.ch3_radio.isChecked(), self.ch4_radio.isChecked()),
+        }
+
+        for x in config.get('ip').split('.'):
+            if not x.isdigit() or not 0 <= int(x) <= 255:
+                QMessageBox.warning(self, "IP inválido", "O endereço IP inserido não é válido.")
+                return 
+
+        if self.analysis_window is None:
+            self.analysis_window = AnalysisWindow()
+            icon = os.path.join(cur_dir, "img", "logo.png")
+            self.analysis_window.setWindowIcon(QIcon(icon))
+            self.analysis_window.closing.connect(self.on_analysis_window_closed)
+            self.analysis_window.load_config(config)
+            self.analysis_window.show()
+            self.hide()
+
+    def on_analysis_window_closed(self):
+        """
+        Callback chamado quando a janela de análise é fechada.
+
+        """
+        self.analysis_window = None
+        self.show()
+
+    def bragg(self):
+        """
+        Configura as opções de porta para o BraggMeter.
+        
+        """
+        self.com_lbl.setEnabled(True)
+        self.port_combo.clear()
+        self.port_combo.addItem('3500')
+        self.port_combo.addItem('3365')
+        self.port_combo.setEnabled(True)
+        self.start_btn.setEnabled(True)
+        self.ip_lbl.setEnabled(True)
+        self.ip_lineEdit.setEnabled(True)
+
+    def setSpins(self, min: int, max: int, minVal: int = None, maxVal: int = None):
+        """
+        Configura os limites e valores iniciais dos spin boxes de comprimento de onda.
+        
+        """
+        self.minNm_spin.setRange(min, max-1)
+        self.maxNm_spin.setRange(min+1, max)
+        if minVal:
+            self.minNm_spin.setValue(minVal)
+        else:
+            self.minNm_spin.setValue(min)
+        if maxVal:
+            self.maxNm_spin.setValue(maxVal)
+        else:
+            self.maxNm_spin.setValue(max)
+
+    def set_port_options(self, inter: str):
+        """
+        Ajusta as opções de porta com base no tipo de interface selecionado (serial e TCP/IP).
+
+        """
+        match inter:
+            case 'IBSEN IMON-512':
+                self.ip_lbl.setEnabled(False)
+                self.ip_lineEdit.setEnabled(False)
+                self.com_lbl.setEnabled(True)
+                self.setSpins(1510, 1595)
+                self.update_coms()
+            case 'BRAGGMETER FS22DI':
+                self.bragg()
+                self.setSpins(1500, 1600)
+                self.ip_lineEdit.setText("10.0.0.10")
+            case 'BRAGGMETER FS22DI HBM':
+                self.bragg()
+                self.setSpins(1500, 1600)
+                self.ip_lineEdit.setText("192.168.1.19")
+            case 'THORLABS CCT11':
+                self.ip_lbl.setEnabled(False)
+                self.ip_lineEdit.setEnabled(False)
+                self.com_lbl.setEnabled(False)
+                self.port_combo.setEnabled(False)
+                self.setSpins(350, 700)
+            case 'THORLABS OSA203':
+                self.ip_lbl.setEnabled(False)
+                self.ip_lineEdit.setEnabled(False)
+                self.com_lbl.setEnabled(False)
+                self.port_combo.setEnabled(False)
+                self.setSpins(1000, 2500, 1450, 1650)
+
+    def channel_toggled(self):
+        """
+        Habilita o botão de iniciar análise apenas se pelo menos um canal estiver selecionado.
+
+        """
+        if any(ch.isChecked() for ch in [self.ch1_radio, self.ch2_radio, self.ch3_radio, self.ch4_radio]):
+            self.start_btn.setEnabled(True)
+        else:
+            self.start_btn.setEnabled(False)
+
+    def update_coms(self):
+        """
+        Procura por portas seriais com o fabricante FTDI e Silicon Labs.
+
+        """
+        ports = list_ports.comports()
+        imon = [port for port in ports if 'FTDI' in port.manufacturer]
+        switch = [port for port in ports if 'Silicon Labs' in port.manufacturer]
+        # Armazena todas as portas de switch detectadas
+        self.switch_ports = [port.device for port in switch] if switch else []
+
+        if self.inter_combo.currentText() == 'IBSEN IMON-512':
+            self.port_combo.clear()
+            if not imon:
+                self.port_combo.addItem("Dispositivo não encontrado")
+                self.port_combo.setEnabled(False)
+                self.start_btn.setEnabled(False)
+            else:
+                self.port_combo.setEnabled(True)
+                self.start_btn.setEnabled(True)
+                for port in imon:
+                    self.port_combo.addItem(port.device)
+
+        for ch in [self.ch1_radio, self.ch2_radio, self.ch3_radio, self.ch4_radio]:
+            ch.setEnabled(bool(switch))
+        self.ch_lbl.setEnabled(bool(switch))
