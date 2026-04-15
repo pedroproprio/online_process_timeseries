@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import QMainWindow, QMessageBox, QApplication
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer, Qt, QSettings
 from PySide6.QtGui import QIcon
 
 from ui.ConfigWindow_ui import Ui_ConfigWindow
@@ -8,6 +8,7 @@ from ui.AnalysisWindow import AnalysisWindow
 from serial.tools import list_ports
 from sys import argv
 import os
+import qdarktheme
 
 class ConfigWindow(QMainWindow, Ui_ConfigWindow):
     """
@@ -40,8 +41,13 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         self.pycct = None
         # Portas dos switches Sercalo (se detectados) - pode haver múltiplos
         self.switch_ports: list[str] = []
+        # Tema atual da aplicação, passado para a janela de análise para manter a consistência visual
+        self.theme: str = 'dark'
+        # Configurações persistentes da UI (somente campos serializáveis)
+        self.settings = QSettings('LiTel', 'online_process_timeseries')
 
         self.setup_connections()
+        self._load_settings()
         self.update_coms()
 
     def setup_connections(self):
@@ -61,6 +67,67 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
             ch.toggled.connect(self.channel_toggled)
 
         self.inter_combo.addItems(['IBSEN IMON-512', 'BRAGGMETER FS22DI', 'BRAGGMETER FS22DI HBM', 'THORLABS CCT11', 'THORLABS OSA203'])
+
+    def _load_settings(self):
+        """
+        Carrega as preferências persistidas da janela de configuração.
+
+        """
+        inter = self.settings.value('config/inter', self.inter_combo.currentText(), type=str)
+        inter_index = self.inter_combo.findText(inter)
+        if inter_index >= 0:
+            self.inter_combo.setCurrentIndex(inter_index)
+
+        self.minNm_spin.setValue(self.settings.value('config/min_nm', self.minNm_spin.value(), type=int))
+        self.maxNm_spin.setValue(self.settings.value('config/max_nm', self.maxNm_spin.value(), type=int))
+        self.resPm_spin.setValue(self.settings.value('config/res_pm', self.resPm_spin.value(), type=int))
+        self.ip_lineEdit.setText(self.settings.value('config/ip', self.ip_lineEdit.text(), type=str))
+
+        fiber = self.settings.value('config/fiber', self.fiber_combo.currentText(), type=str)
+        fiber_index = self.fiber_combo.findText(fiber)
+        if fiber_index >= 0:
+            self.fiber_combo.setCurrentIndex(fiber_index)
+
+        self.theme = self.settings.value('config/theme', self.theme, type=str)
+        if self.theme not in ('light', 'dark'):
+            self.theme = 'dark'
+        self._apply_theme()
+
+        self.ch1_radio.setChecked(self.settings.value('config/ch1', self.ch1_radio.isChecked(), type=bool))
+        self.ch2_radio.setChecked(self.settings.value('config/ch2', self.ch2_radio.isChecked(), type=bool))
+        self.ch3_radio.setChecked(self.settings.value('config/ch3', self.ch3_radio.isChecked(), type=bool))
+        self.ch4_radio.setChecked(self.settings.value('config/ch4', self.ch4_radio.isChecked(), type=bool))
+        self.channel_toggled()
+
+    def _apply_theme(self):
+        """
+        Aplica o tema atual salvo na ConfigWindow.
+
+        """
+        if self.theme not in ('light', 'dark'):
+            self.theme = 'dark'
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(qdarktheme.load_stylesheet(self.theme))
+
+    def _save_settings(self):
+        """
+        Salva as preferências da janela de configuração.
+
+        Observação: a porta COM/TCP não é persistida por depender do ambiente atual.
+        """
+        self.settings.setValue('config/inter', self.inter_combo.currentText())
+        self.settings.setValue('config/min_nm', int(self.minNm_spin.value()))
+        self.settings.setValue('config/max_nm', int(self.maxNm_spin.value()))
+        self.settings.setValue('config/res_pm', int(self.resPm_spin.value()))
+        self.settings.setValue('config/ip', self.ip_lineEdit.text())
+        self.settings.setValue('config/fiber', self.fiber_combo.currentText())
+        self.settings.setValue('config/ch1', self.ch1_radio.isChecked())
+        self.settings.setValue('config/ch2', self.ch2_radio.isChecked())
+        self.settings.setValue('config/ch3', self.ch3_radio.isChecked())
+        self.settings.setValue('config/ch4', self.ch4_radio.isChecked())
+        self.settings.setValue('config/theme', self.theme)
+        self.settings.sync()
 
     def start_analysis(self):
         """
@@ -96,10 +163,12 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
             'res': self.resPm_spin.value()*1e-12,
             'port': self.port_combo.currentText(),
             'ip': self.ip_lineEdit.text(),
+            'fiber': self.fiber_combo.currentText(),
             'path': self.file_path,
             'sdk': osa,
             'switch_ports': self.switch_ports,  # Lista de todas as portas de switch
             'channels': (self.ch1_radio.isChecked(), self.ch2_radio.isChecked(), self.ch3_radio.isChecked(), self.ch4_radio.isChecked()),
+            'theme': self.theme,
         }
 
         for x in config.get('ip').split('.'):
@@ -107,21 +176,26 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
                 QMessageBox.warning(self, "IP inválido", "O endereço IP inserido não é válido.")
                 return 
 
+        self._save_settings()
+
         if self.analysis_window is None:
             self.analysis_window = AnalysisWindow()
-            icon = os.path.join(cur_dir, "img", "logo.png")
+            icon = os.path.join(cur_dir, "img", "litel.png")
             self.analysis_window.setWindowIcon(QIcon(icon))
-            self.analysis_window.closing.connect(self.on_analysis_window_closed)
+            self.analysis_window.closing.connect(lambda theme: self.on_analysis_window_closed(theme))
             self.analysis_window.load_config(config)
             self.analysis_window.show()
             self.hide()
 
-    def on_analysis_window_closed(self):
+    def on_analysis_window_closed(self, theme: str):
         """
         Callback chamado quando a janela de análise é fechada.
 
         """
         self.analysis_window = None
+        self.theme = theme
+        self._apply_theme()
+        self._save_settings()
         self.show()
 
     def bragg(self):
@@ -222,4 +296,16 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
 
         for ch in [self.ch1_radio, self.ch2_radio, self.ch3_radio, self.ch4_radio]:
             ch.setEnabled(bool(switch))
+            if not switch:
+                ch.setChecked(False)
+        if not switch:
+            self.ch1_radio.setChecked(True)
         self.ch_lbl.setEnabled(bool(switch))
+
+    def closeEvent(self, event):
+        """
+        Salva as preferências persistentes ao fechar a janela.
+
+        """
+        self._save_settings()
+        super().closeEvent(event)

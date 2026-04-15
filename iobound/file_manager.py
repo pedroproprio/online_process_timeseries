@@ -3,18 +3,19 @@ from PySide6.QtWidgets import QFileDialog, QMessageBox
 import numpy as np
 import h5py
 
-def append_hdf5_samples(
-        range_cfg: tuple,
-        res: float,
-        file_path: str,
-        inter: str,
-        intensities: np.ndarray,
-        timestamps: np.ndarray,
-        valleys: np.ndarray,
-        sample_name: str):
+def append_samples(
+    range_cfg: tuple,
+    res: float,
+    file_path: str,
+    inter: str,
+    intensities: np.ndarray,
+    timestamps: np.ndarray,
+    values,
+    sample_name: str,
+    dataset_name: str = "Vale"):
     """
     Acrescenta registros no arquivo HDF5 usando o formato:
-    interface -> parâmetros -> amostra -> datasets (Intensidades, Timestamp, Vale)
+    interface -> parâmetros -> amostra -> datasets (Intensidades, Timestamp, Vale/Picos)
     Args:
     - range_cfg: tupla (nm_min, nm_max) representando o intervalo de comprimento de onda.
     - res: resolução espectral em pm.
@@ -22,12 +23,29 @@ def append_hdf5_samples(
     - inter: nome da interface
     - intensities: array 1D de intensidades interpoladas.
     - timestamps: array 1D de timestamps correspondentes a cada registro.
-    - valleys: array 1D de comprimentos de onda dos vales correspondentes a cada registro.
+    - values: array 1D de vales/picos correspondentes a cada registro.
     - sample_name: nome da amostra
+    - dataset_name: nome do dataset de valores ('Vale' ou 'Picos').
 
     """
     param = f"{int(range_cfg[0]*1e9)}-{int(range_cfg[1]*1e9)},{res*1e12:.1f}" # nm, nm, pm
     spec_len = intensities.shape[1]
+    values_list = list(values)
+
+    def _ensure_peak_dataset(group, name: str, size: int):
+        if name in group:
+            return group[name]
+        return group.create_dataset(
+            name,
+            shape=(size,),
+            maxshape=(None,),
+            dtype=h5py.vlen_dtype(np.float64),
+            chunks=True
+        )
+
+    def _store_peak_values(dataset, start_index: int, peak_values):
+        for offset, peak_value in enumerate(peak_values):
+            dataset[start_index + offset] = np.asarray(peak_value, dtype=np.float64)
 
     with h5py.File(file_path, "a") as f:
         if inter not in f:
@@ -54,18 +72,27 @@ def append_hdf5_samples(
                 dtype="float64",
                 chunks=True
             )
-            s.create_dataset(
-                "Vale",
-                data=np.asarray(valleys, dtype=np.float64),
-                maxshape=(None,),
-                dtype="float64",
-                chunks=True
-            )
+            if dataset_name == "Picos":
+                peaks_ds = s.create_dataset(
+                    "Picos",
+                    shape=(len(values_list),),
+                    maxshape=(None,),
+                    dtype=h5py.vlen_dtype(np.float64),
+                    chunks=True
+                )
+                _store_peak_values(peaks_ds, 0, values_list)
+            else:
+                s.create_dataset(
+                    "Vale",
+                    data=np.asarray(values_list, dtype=np.float64),
+                    maxshape=(None,),
+                    dtype="float64",
+                    chunks=True
+                )
             return
 
         intensities_ds = s["Intensidades"]
         timestamps_ds = s["Timestamp"]
-        wavelengths_ds = s["Vale"]
 
         if intensities_ds.shape[1] != spec_len:
             raise ValueError(
@@ -78,11 +105,26 @@ def append_hdf5_samples(
 
         intensities_ds.resize((n_old + n_new, spec_len))
         timestamps_ds.resize((n_old + n_new,))
-        wavelengths_ds.resize((n_old + n_new,))
 
         intensities_ds[n_old:n_old+n_new] = np.asarray(intensities, dtype=np.float32)
         timestamps_ds[n_old:n_old+n_new] = np.asarray(timestamps, dtype=np.float64)
-        wavelengths_ds[n_old:n_old+n_new] = np.asarray(valleys, dtype=np.float64)
+
+        if dataset_name == "Picos":
+            peaks_ds = _ensure_peak_dataset(s, "Picos", n_old + n_new)
+            peaks_ds.resize((n_old + n_new,))
+            _store_peak_values(peaks_ds, n_old, values_list)
+        else:
+            if "Vale" not in s:
+                s.create_dataset(
+                    "Vale",
+                    shape=(n_old + n_new,),
+                    maxshape=(None,),
+                    dtype="float64",
+                    chunks=True
+                )
+            valleys_ds = s["Vale"]
+            valleys_ds.resize((n_old + n_new,))
+            valleys_ds[n_old:n_old+n_new] = np.asarray(values_list, dtype=np.float64)
 
 def prompt_save_file(self) -> str:
     """
@@ -133,7 +175,7 @@ def prompt_open_file(self) -> str | None:
                 if not isinstance(param_group, h5py.Group):
                     continue
                 for _, sample_group in param_group.items():
-                    if isinstance(sample_group, h5py.Group) and "Vale" in sample_group:
+                    if isinstance(sample_group, h5py.Group) and "Timestamp" in sample_group and ("Vale" in sample_group or "Picos" in sample_group):
                         is_new_valid = True
                         break
                 if is_new_valid:
@@ -151,16 +193,22 @@ def prompt_open_file(self) -> str | None:
     except Exception as e:
         QMessageBox.warning(self, "Arquivo inválido", f"Falha ao abrir arquivo HDF5: {e}")
 
-def load_hdf5_samples(file_path: str, inter: str) -> dict:
+def load_samples(file_path: str, inter: str) -> dict:
     """
     Carrega os dados de um arquivo HDF5 e organiza os datasets por amostra.
     Returns:
-        dict: Um dicionário onde as chaves são os nomes das amostras e os valores são listas de datasets.
+        dict: {sample_name: {"dataset": "Vale"|"Picos", "values": [...]}}
 
     """
     with h5py.File(file_path, "r") as f:
         g = f[inter]
         grouped_samples = {}
+
+        def _to_peak_list(entry) -> list[float]:
+            values = np.asarray(entry, dtype=float)
+            if values.ndim == 0:
+                return [float(values)]
+            return values.ravel().tolist()
 
         # Formato: interface -> parâmetros -> amostra -> datasets
         for param_name, param_group in g.items():
@@ -169,14 +217,21 @@ def load_hdf5_samples(file_path: str, inter: str) -> dict:
             for sample_name, sample_group in param_group.items():
                 if not isinstance(sample_group, h5py.Group):
                     continue
-                if "Vale" not in sample_group:
+                if "Timestamp" not in sample_group:
                     continue
 
-                sample_wavelengths = np.asarray(
-                    sample_group["Vale"][:],
-                    dtype=float
-                )
-                if len(sample_wavelengths) == 0:
+                dataset_name = "Picos" if "Picos" in sample_group else "Vale" if "Vale" in sample_group else None
+                if dataset_name is None:
                     continue
-                grouped_samples.setdefault(sample_name, []).extend(sample_wavelengths.tolist())
+
+                if dataset_name == "Picos":
+                    peaks_by_timestamp = [_to_peak_list(entry) for entry in sample_group[dataset_name][:]]
+                    if len(peaks_by_timestamp) == 0:
+                        continue
+                    grouped_samples.setdefault(sample_name, {"dataset": "Picos", "values": []})["values"].extend(peaks_by_timestamp)
+                else:
+                    valleys = np.asarray(sample_group[dataset_name][:], dtype=float).ravel().tolist()
+                    if len(valleys) == 0:
+                        continue
+                    grouped_samples.setdefault(sample_name, {"dataset": "Vale", "values": []})["values"].extend(valleys)
     return grouped_samples

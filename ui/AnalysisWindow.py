@@ -1,13 +1,13 @@
 from PySide6.QtWidgets import (QMainWindow, QMessageBox, QGraphicsRectItem, QInputDialog, QDialog, QPushButton, 
-    QMenu, QApplication, QFormLayout, QSpinBox, QDialogButtonBox, QLineEdit, QCompleter)
+    QMenu, QApplication, QFormLayout, QSpinBox, QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCompleter)
 from PySide6.QtGui import QColor, QLinearGradient, QBrush, QIcon, QPalette, QGradient
-from PySide6.QtCore import Signal, QThread, QTimer, Qt
+from PySide6.QtCore import Signal, QThread, QTimer, Qt, QLocale, QSettings
 
 from ui.AnalysisWindow_ui import Ui_AnalysisWindow
 from ui.toggle import ToggleSwitch
-from core.processing import find_resonant_wavelength, preprocess_plot_data
+from core.processing import find_resonant_wavelength, find_wavelength_peaks, preprocess_plot_data
 from core.data_acquisition import DataAcquisition
-from iobound.file_manager import append_hdf5_samples, prompt_save_file, prompt_open_file, load_hdf5_samples
+from iobound.file_manager import append_samples, prompt_save_file, prompt_open_file, load_samples
 
 from scipy.signal import windows
 from scipy.interpolate import interp1d
@@ -34,7 +34,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
     
     """
     # Sinal para indicar à ConfigWindow que esta janela está sendo fechada
-    closing = Signal()
+    closing = Signal(str)
     request_data_signal = Signal(int, int)
     stop_worker_signal = Signal()
 
@@ -51,22 +51,32 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # Lista para armazenar os dados dos espectros lidos
         # Formato: [(wavelength_array, power_array), ...]
         self.spectra_data: list | None = None
-        # Objeto para a Região de Interesse (ROI) no gráfico
-        self.roi_region: pg.LinearRegionItem | None = None
+        # Objeto para a Região de Interesse (ROI) no gráfico espectral
+        self.roi_region = pg.LinearRegionItem(orientation=pg.LinearRegionItem.Vertical)
         # Objeto para a Região de Interesse (ROI) dos dados processados (no gráfico temporal)
-        self.temporal_roi_region: pg.LinearRegionItem | None = None
+        self.temporal_roi_region = pg.LinearRegionItem(orientation=pg.LinearRegionItem.Vertical, brush=(0, 255, 0, 30))
+
         # Limites da ROI para o processamento de picos
         self.roi_range: list | None = None
+        # Parâmetros de detecção de picos no modo FBG
+        self.peak_detection_params = {
+            'prominence': 300.0,
+            'width': 2.0,
+            'distance': 40,
+        }
+        # Rastreador de cores para picos FBG: mapeia wavelength (em metros) para cor
+        # Garante que o mesmo pico mantém a mesma cor ao longo do tempo
+        self.fbg_peak_color_map: dict[float, tuple] = {}
         # Comprimentos de onda fixos para interpolação (em metros)
         self.fixed_wavelengths: np.ndarray | None = None
         # Dicionário de listas para armazenar os resultados processados
-        self.results_df = {'Timestamp': [], 'Intensidade': [], 'Vale': []}
+        self.results_df = self._empty_result_store()
         # Dicionário com os dados das amostras para o box plot
         self.samples = {}
         # Tempo de exposição (µs)
         self.exposure_time: float = 0.0
         # Intervalo entre amostras (ms)
-        self.sample_rate: int = 100
+        self.sample_rate: int = 0
         # Duração da amostra contínua (s)
         self.sample_duration: int | None = None
         # Nome da amostra contínua
@@ -76,19 +86,19 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # Timer para flush periódico dos dados no modo contínuo
         self.flush_timer: QTimer | None = None
         # Buffer para salvar em lote no modo contínuo
-        self.pending_hdf5 = {'Timestamp': [], 'Intensidade': [], 'Vale': []}
+        self.pending_hdf5 = self._empty_result_store()
         # Tamanho do lote para flush no modo contínuo
         self.flush_batch_size: int = 25
         # Intervalo para flush automático no modo contínuo (ms)
         self.flush_interval_ms: int = 15000
-        # Limite de pontos mantidos em memória para evitar lentidão da UI
+        # Limite de inflec mantidos em memória para evitar lentidão da UI
         self.max_live_points: int = 5000
         # Unidade do eixo x (comprimento de onda)
         self.xUnit: str = 'nm'
         # Unidade fixa para temporal/boxplot (não muda com actions de unidade)
         self.resultUnit: str = 'nm'
-        # Tema atual da interface
-        self.theme: str = ''
+        # Tema atual persistido
+        self.theme: str = 'dark'
         self.theme_colors = {}
         # Cores fixas para os canais exibidos na tab Merge
         self.merge_channel_colors = [
@@ -152,11 +162,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         
         # Instância compartilhada de PyCCT/OSA para evitar conflito de múltiplas instâncias
         self.osa = None
+        # Configurações persistentes da janela de análise
+        self.settings = QSettings('LiTel', 'online_process_timeseries')
 
-        self.set_theme(qdarktheme.get_theme()) # Aplica o tema inicial
-        self.actionNm.setChecked(True) # Define nm como unidade inicial do eixo X
-        self.setup_plot()
         self.setup_connections()
+        self.setup_plot()
+        self._load_persistent_settings()
 
     def setup_plot(self):
         """
@@ -172,8 +183,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.spectraPlotWidget.setAxisItems({'bottom': xAxis})
 
         # Adiciona a região de seleção (ROI)
-        self.roi_region = pg.LinearRegionItem(orientation=pg.LinearRegionItem.Vertical)
-        self.roi_region.setBrush(self.theme_colors['roi_spec'])
         self.spectraPlotWidget.addItem(self.roi_region)
 
         # --- Configuração do gráfico: Evolução Temporal ---
@@ -185,16 +194,46 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         yAxis.enableAutoSIPrefix(False) # Mantém unidades em nm
         self.temporalPlotWidget.setAxisItems({'left': yAxis})
 
-        # Adiciona a região de seleção (ROI) para o gráfico temporal
-        self.temporal_roi_region = pg.LinearRegionItem(orientation=pg.LinearRegionItem.Vertical, brush=(0, 255, 0, 30))
-
         # --- Configuração do gráfico: Box Plot ---
         self.boxPlot = self.boxPlotWidget.addPlot()
         self.boxLegend = self.boxPlot.addLegend()
         self.boxPlot.setXRange(0, 2)
         self.boxPlot.getAxis('bottom').setTicks([]) # Remove os números do eixo X
 
-        self._setup_merge_plots()
+    def setup_connections(self):
+        """
+        Conecta os sinais dos widgets (eventos) aos seus respectivos slots (métodos).
+
+        """
+        self.stop_btn.clicked.connect(self.toggle_thread) # Inicia/Para a aquisição de dados
+        self.save_btn.clicked.connect(self.save_data) # Salva os dados processados
+        self.clear_btn.clicked.connect(self.clear_plot) # Limpa os gráficos
+        self.apodization_btn.clicked.connect(self.select_apodization_method)
+        self.savgol_btn.clicked.connect(self.select_savgol_parameters)
+        self.mean_btn.clicked.connect(self.select_mean_samples)
+        self.actionPeaks.triggered.connect(self.select_peak_parameters)
+        self.temporal_roi_region.sigRegionChanged.connect(self.roi_changed) # Atualiza o box plot mesmo com a aquisição parada
+        self.roi_region.sigRegionChanged.connect(self._spectrum_roi_changed)
+        
+        # Botões de fixar um espectro
+        for button in self._list_fix_buttons():
+            button.setContextMenuPolicy(Qt.CustomContextMenu)
+            button.customContextMenuRequested.connect(lambda pos, btn=button: self.toggle_fix(btn, pos))
+            button.clicked.connect(lambda b, btn=button: self.fix_btn_clicked(btn, btn.isChecked()))
+
+        self.actionM.triggered.connect(lambda: self.unit_changed('m'))
+        self.actionUm.triggered.connect(lambda: self.unit_changed('um'))
+        self.actionNm.triggered.connect(lambda: self.unit_changed('nm'))
+        self.actionPm.triggered.connect(lambda: self.unit_changed('pm'))
+        self.actionLight.triggered.connect(lambda: self.set_theme('light'))
+        self.actionDark.triggered.connect(lambda: self.set_theme('dark'))
+        self.actionHelp.triggered.connect(lambda: webbrowser.open(
+            'https://github.com/pedroproprio/online_process_timeseries/blob/main/README.md'))
+        self.actionOpenFile.triggered.connect(self.open_file)
+        self.actionNewWindow.triggered.connect(self.open_new_window)
+
+        # Toggle
+        self.continuous_chk = ToggleSwitch(self.continuous_hlay)
 
         # Ícones dos botões
         cur_dir = os.path.dirname(os.path.abspath(argv[0]))
@@ -204,6 +243,468 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.savgol_btn.setIcon(QIcon(svg))
         mean = os.path.join(cur_dir, "img", "mean.png")
         self.mean_btn.setIcon(QIcon(mean))
+
+        # Conecta atalhos do teclado
+        self.actionOpenFile.setShortcut('Ctrl+A')
+        self.actionNewWindow.setShortcut('Ctrl+N')
+        self.actionPeaks.setShortcut('Ctrl+E')
+        self.stop_btn.setShortcut('Return')
+        self.clear_btn.setShortcut('Ctrl+L')
+        self.save_btn.setShortcut('Ctrl+S')
+        self.apodization_btn.setShortcut('A')
+        self.savgol_btn.setShortcut('S')
+        self.mean_btn.setShortcut('M')
+        for i, button in enumerate(self._list_fix_buttons()):
+            button.setShortcut(f'{i+1}') # Atalhos 1-6 para fixar espectros
+
+        # Tabs
+        self.tabWidget.currentChanged.connect(self._on_tab_changed)
+
+    def _load_persistent_settings(self):
+        """
+        Carrega preferências persistidas da janela de análise.
+
+        """
+        saved_sample_rate = self.settings.value('analysis/sample_rate', self.sr_spin.value(), type=int)
+        self.sr_spin.setValue(max(1, int(saved_sample_rate)))
+        self.sample_rate = int(self.sr_spin.value())
+
+        saved_window = self.settings.value('analysis/savgol_window_points', self.savgol_window_points, type=int)
+        saved_poly = self.settings.value('analysis/savgol_polyorder', self.savgol_polyorder, type=int)
+        window_points = max(0, int(saved_window))
+        if window_points % 2 == 0 and window_points > 0:
+            window_points -= 1
+        polyorder = max(1, int(saved_poly))
+        if window_points > 0 and polyorder >= window_points:
+            polyorder = max(1, window_points - 1)
+        self.savgol_window_points = window_points
+        self.savgol_polyorder = polyorder
+
+        saved_apodization = self.settings.value('analysis/apodization', 'None', type=str)
+        if saved_apodization in self.apodization_methods:
+            self.apodization = saved_apodization
+        else:
+            self.apodization = None
+
+        saved_mean = self.settings.value('analysis/mean_samples', self.mean_samples, type=int)
+        self.mean_samples = max(1, min(1000, int(saved_mean)))
+
+        saved_prominence = self.settings.value(
+            'analysis/peak_prominence',
+            self.peak_detection_params['prominence'],
+            type=float,
+        )
+        saved_width = self.settings.value(
+            'analysis/peak_width',
+            self.peak_detection_params['width'],
+            type=float,
+        )
+        saved_distance = self.settings.value(
+            'analysis/peak_distance',
+            self.peak_detection_params['distance'],
+            type=int,
+        )
+        self.peak_detection_params['prominence'] = max(0.0, float(saved_prominence))
+        self.peak_detection_params['width'] = max(0.0, float(saved_width))
+        self.peak_detection_params['distance'] = max(1, int(saved_distance))
+
+        saved_theme = self.settings.value('analysis/theme', self.theme, type=str)
+        self.theme = saved_theme if saved_theme in ('light', 'dark') else 'dark'
+
+        saved_unit = self.settings.value('analysis/x_unit', self.xUnit, type=str)
+        self.xUnit = saved_unit if saved_unit in ('m', 'um', 'nm', 'pm') else 'nm'
+        self.actionM.setChecked(self.xUnit == 'm')
+        self.actionUm.setChecked(self.xUnit == 'um')
+        self.actionNm.setChecked(self.xUnit == 'nm')
+        self.actionPm.setChecked(self.xUnit == 'pm')
+        self._set_spectrum_axis_unit()
+
+    def _save_persistent_settings(self):
+        """
+        Salva preferências persistentes da janela de análise.
+
+        """
+        self.settings.setValue('analysis/sample_rate', int(self.sr_spin.value()))
+        self.settings.setValue('analysis/savgol_window_points', int(self.savgol_window_points))
+        self.settings.setValue('analysis/savgol_polyorder', int(self.savgol_polyorder))
+        self.settings.setValue('analysis/apodization', self.apodization or 'None')
+        self.settings.setValue('analysis/mean_samples', int(self.mean_samples))
+        self.settings.setValue('analysis/peak_prominence', float(self.peak_detection_params['prominence']))
+        self.settings.setValue('analysis/peak_width', float(self.peak_detection_params['width']))
+        self.settings.setValue('analysis/peak_distance', int(self.peak_detection_params['distance']))
+
+        theme_value = self.theme
+        if isinstance(self.config_data, dict):
+            theme_value = self.config_data.get('theme', theme_value)
+        if theme_value not in ('light', 'dark'):
+            theme_value = 'dark'
+        self.settings.setValue('analysis/theme', theme_value)
+
+        x_unit_value = self.xUnit if self.xUnit in ('m', 'um', 'nm', 'pm') else 'nm'
+        self.settings.setValue('analysis/x_unit', x_unit_value)
+        self._save_roi_for_current_mode()
+        self.settings.sync()
+
+    def _roi_settings_key(self) -> str | None:
+        """
+        Retorna a chave de settings da ROI por interface e tipo de fibra.
+
+        """
+        if not isinstance(self.config_data, dict):
+            return None
+
+        inter = str(self.config_data.get('inter', '')).strip()
+        fiber = str(self.config_data.get('fiber', '')).strip()
+        if not inter or not fiber:
+            return None
+
+        inter_key = inter.replace('/', '_')
+        fiber_key = fiber.replace('/', '_')
+        return f'analysis/roi_range/{inter_key}/{fiber_key}'
+
+    def _save_roi_for_current_mode(self):
+        """
+        Salva a ROI espectral atual para a combinação interface+fibra.
+        A persistência é feita em metros para manter consistência entre unidades.
+
+        """
+        key = self._roi_settings_key()
+        if key is None or self.roi_range is None:
+            return
+
+        unit_to_m = self._unit_to_meter_factor(self.xUnit)
+        roi_min_m = float(self.roi_range[0]) * unit_to_m
+        roi_max_m = float(self.roi_range[1]) * unit_to_m
+        if roi_max_m <= roi_min_m:
+            return
+
+        self.settings.setValue(key, f'{roi_min_m},{roi_max_m}')
+
+    def _restore_roi_for_current_mode(self):
+        """
+        Restaura a ROI espectral salva para a combinação interface+fibra.
+        Converte de metros para a unidade de eixo X atualmente ativa.
+
+        """
+        default_roi = self._default_roi_for_current_mode()
+        key = self._roi_settings_key()
+        if key is None:
+            if default_roi is not None:
+                self.roi_range = default_roi
+                self.roi_region.setRegion(self.roi_range)
+            return
+
+        value = self.settings.value(key, '', type=str)
+        if not value:
+            if default_roi is not None:
+                self.roi_range = default_roi
+                self.roi_region.setRegion(self.roi_range)
+            return
+
+        try:
+            roi_min_m_str, roi_max_m_str = [part.strip() for part in value.split(',')]
+            roi_min_m = float(roi_min_m_str)
+            roi_max_m = float(roi_max_m_str)
+        except Exception:
+            if default_roi is not None:
+                self.roi_range = default_roi
+                self.roi_region.setRegion(self.roi_range)
+            return
+
+        if roi_max_m <= roi_min_m:
+            if default_roi is not None:
+                self.roi_range = default_roi
+                self.roi_region.setRegion(self.roi_range)
+            return
+
+        m_to_unit = 1.0 / self._unit_to_meter_factor(self.xUnit)
+        self.roi_range = [roi_min_m * m_to_unit, roi_max_m * m_to_unit]
+        self.roi_region.setRegion(self.roi_range)
+
+    def _default_roi_for_current_mode(self) -> list[float] | None:
+        """
+        Retorna a ROI padrão (25%-75% do range configurado) para o modo atual.
+        Essa regra replica o padrão aplicado em update_plot quando não há ROI.
+
+        """
+        if not isinstance(self.config_data, dict):
+            return None
+
+        range_cfg = self.config_data.get('range')
+        if not range_cfg or len(range_cfg) != 2:
+            return None
+
+        x_min_m = float(min(range_cfg[0], range_cfg[1]))
+        x_max_m = float(max(range_cfg[0], range_cfg[1]))
+        if x_max_m <= x_min_m:
+            return None
+
+        m_to_unit = 1.0 / self._unit_to_meter_factor(self.xUnit)
+        x_min = x_min_m * m_to_unit
+        x_max = x_max_m * m_to_unit
+        x_range = x_max - x_min
+        return [x_min + 0.25 * x_range, x_max - 0.25 * x_range]
+
+    def _empty_result_store(self) -> dict:
+        """
+        Returns: 
+            dict: um dicionário vazio para armazenar os resultados processados, com chaves pré-definidas.
+        
+        """
+        return {'Timestamp': [], 'Intensidade': [], 'Vale': [], 'Picos': []}
+
+    def _result_key(self) -> str:
+        """
+        Returns:
+            str: a chave correta para armazenar os resultados processados, dependendo do tipo de fibra selecionada.
+        
+        """
+        return 'Picos' if self.config_data.get('fiber') in ('FBG', 'Interferômetro') else 'Vale'
+
+    def _flatten_peak_values(self, values) -> list[float]:
+        """
+        Args:
+            values: uma lista que pode conter valores numéricos únicos ou arrays de picos.
+        Returns:
+            list[float]: uma lista "achatada" de valores numéricos, convertendo arrays e valores únicos para float.
+        
+        """
+        flattened: list[float] = []
+        for item in values or []:
+            array = np.asarray(item, dtype=float)
+            if array.ndim == 0:
+                flattened.append(float(array))
+            else:
+                flattened.extend(array.ravel().tolist())
+        return flattened
+
+    def _peak_series_colors(self, count: int):
+        """
+        Args:
+            count (int): o número de séries de picos distintas a serem coloridas.
+        Returns:
+            list[pg.mkColor]: uma lista de cores distintas para cada série de picos.
+        
+        """
+        if count <= 0:
+            return []
+        hues = max(count, 3)
+        return [pg.intColor(index, hues=hues) for index in range(count)]
+
+    def _fbg_peak_match_tolerance_m(self) -> float:
+        """
+        Returns:
+            float: a tolerância (em metros) para associar picos FBG entre medições.
+        
+        """
+        res_m = self.config_data.get('res') if self.config_data else None
+        if res_m is None:
+            return 0.0
+        return float(self.peak_detection_params['distance']) * float(res_m)
+
+    def _find_matching_peak_key(self, peak_map: dict, wavelength: float) -> float | None:
+        """
+        Busca uma chave existente no mapa de picos dentro da tolerância configurada.
+        Args:
+            peak_map (dict): Dicionário onde as chaves são os wavelengths de referência dos picos.
+            wavelength (float): O comprimento de onda do pico a ser associado.
+        Returns:
+            float | None: O comprimento de onda da chave correspondente encontrada, ou None se não houver correspondência dentro da tolerância.
+            
+        """
+        tolerance = self._fbg_peak_match_tolerance_m()
+        for existing_wl in peak_map.keys():
+            if abs(existing_wl - wavelength) <= tolerance:
+                return existing_wl
+        return None
+
+    def _group_fbg_peak_series(self, timestamps: list[float], peak_series: list[list[float]]) -> dict[float, list[tuple[float, float]]]:
+        """
+        Agrupa picos FBG por recorrência de comprimento de onda.
+        Args:
+            - timestamps: Lista de timestamps das aquisições.
+            - peak_series: Lista de listas de picos detectados em cada aquisição.
+        Returns:
+            dict: {wavelength_referencia: [(timestamp, wavelength), ...]} ordenado por wavelength.
+        
+        """
+        grouped: dict[float, list[tuple[float, float]]] = {}
+
+        for timestamp, peaks in zip(timestamps, peak_series):
+            for peak_wavelength in sorted(peaks):
+                peak_wavelength = float(peak_wavelength)
+                match_key = self._find_matching_peak_key(grouped, peak_wavelength)
+                if match_key is None:
+                    match_key = peak_wavelength
+                    grouped[match_key] = []
+                grouped[match_key].append((float(timestamp), peak_wavelength))
+
+        return dict(sorted(grouped.items(), key=lambda item: item[0]))
+
+    def _is_temporally_consistent_peak_group(
+        self,
+        group_points: list[tuple[float, float]],
+        all_timestamps: list[float],
+        min_relative_recurrence: float = 0.25,
+        max_allowed_jump_factor: float = 2.5,
+        max_irregular_jump_ratio: float = 0.35,
+    ) -> bool:
+        """
+        Valida se um grupo de pico é recorrente e temporalmente consistente.
+
+        Critérios:
+        - Recorrência relativa mínima no histórico (presença em fração das aquisições);
+        - Saltos temporais entre ocorrências não podem ser majoritariamente irregulares.
+        Args:
+            - group_points: Lista de tuplas (timestamp, wavelength) para um grupo de pico específico.
+            - all_timestamps: Lista de timestamps das aquisições.
+            - min_relative_recurrence: Recorrência relativa mínima.
+            - max_allowed_jump_factor: Fator máximo de salto permitido.
+            - max_irregular_jump_ratio: Proporção máxima de saltos irregulares.
+        Returns:
+            bool: True se o grupo for temporalmente consistente, False caso contrário.
+
+        """
+        total_samples = len(all_timestamps)
+        if total_samples == 0:
+            return False
+
+        group_count = len(group_points)
+        relative_recurrence = group_count / total_samples
+        if relative_recurrence < min_relative_recurrence:
+            return False
+
+        # Para grupos muito curtos, a recorrência relativa já é o principal critério.
+        if group_count < 3:
+            return True
+
+        ts_all = np.asarray(all_timestamps, dtype=float)
+        global_jumps = np.diff(ts_all)
+        global_jumps = global_jumps[global_jumps > 0]
+        if global_jumps.size == 0:
+            return True
+
+        expected_jump = float(np.median(global_jumps))
+        if expected_jump <= 0:
+            return True
+
+        ts_group = np.asarray([point[0] for point in group_points], dtype=float)
+        ts_group.sort()
+        group_jumps = np.diff(ts_group)
+        group_jumps = group_jumps[group_jumps > 0]
+        if group_jumps.size == 0:
+            return True
+
+        jump_factor = group_jumps / expected_jump
+        irregular_jumps = jump_factor > max_allowed_jump_factor
+        irregular_ratio = float(np.mean(irregular_jumps))
+
+        return irregular_ratio <= max_irregular_jump_ratio
+
+    def _recurring_fbg_peak_groups(self, timestamps: list[float], peak_series: list[list[float]], min_count: int = 2) -> dict[float, list[tuple[float, float]]]:
+        """
+        Filtra grupos de picos FBG recorrentes e temporalmente consistentes.
+        Args:
+            - timestamps: Lista de timestamps das aquisições.
+            - peak_series: Lista de listas de picos detectados em cada aquisição.
+            - min_count: Número mínimo de ocorrências para um grupo ser considerado recorrente.
+        Returns:
+            dict: {wavelength_referencia: [(timestamp, wavelength), ...]}
+
+        """
+        grouped = self._group_fbg_peak_series(timestamps, peak_series)
+        filtered = {}
+        for wl, points in grouped.items():
+            if len(points) < min_count:
+                continue
+            if not self._is_temporally_consistent_peak_group(points, timestamps):
+                continue
+            filtered[wl] = points
+        return filtered
+
+    def _fbg_current_peak_samples(
+        self,
+        timestamps: list[float],
+        peak_series: list[list[float]],
+        label_prefix: str = "Atual",
+        feature_label: str = "Pico",
+    ) -> list[tuple[str, tuple]]:
+        """
+        Retorna box plots por pico FBG recorrente dentro da ROI temporal ativa.
+        """
+        recurring_groups = self._recurring_fbg_peak_groups(timestamps, peak_series, min_count=2)
+        if not recurring_groups:
+            return []
+
+        roi_min_ts, roi_max_ts = self.temporal_roi_region.getRegion()
+        peak_samples: list[tuple[str, tuple]] = []
+
+        for i, (peak_wavelength, points) in enumerate(recurring_groups.items(), start=1):
+            roi_values_m = [wl for ts, wl in points if roi_min_ts <= ts <= roi_max_ts]
+            if len(roi_values_m) == 0:
+                continue
+            peak_values_unit = self._from_meter(roi_values_m, self.resultUnit)
+            peak_samples.append((f"{label_prefix} - {feature_label} {i}", self.box_plot_statistics(peak_values_unit)))
+
+        return peak_samples
+
+    def _expand_samples_for_boxplot(self) -> list[tuple[str, tuple]]:
+        """Expande amostras salvas para o formato linear esperado pelo plot de box."""
+        expanded: list[tuple[str, tuple]] = []
+        for sample_name, sample_data in self.samples.items():
+            if isinstance(sample_data, list):
+                for sub_label, stats in sample_data:
+                    expanded.append((f"{sample_name} - {sub_label}", stats))
+            else:
+                expanded.append((sample_name, sample_data))
+        return expanded
+
+    def _get_fbg_peak_color(self, wavelength: float) -> tuple:
+        """
+        Obtém ou atribui uma cor consistente para um pico FBG baseado em seu wavelength.
+        Args:
+            wavelength (float): Comprimento de onda em metros.
+        Returns:
+            tuple: Cor (QColor ou valor propto para pyqtgraph).
+
+        """
+        # Procura por um pico existente próximo a este wavelength
+        matching_wl = self._find_matching_peak_key(self.fbg_peak_color_map, wavelength)
+        if matching_wl is not None:
+            return self.fbg_peak_color_map[matching_wl]
+        
+        # Se não encontrou, atribui uma nova cor
+        peak_count = len(self.fbg_peak_color_map)
+        # Garante que sempre temos cores suficientes
+        max_peaks = max(peak_count + 1, 3)
+        new_color = pg.intColor(peak_count, hues=max_peaks)
+        self.fbg_peak_color_map[wavelength] = new_color
+        
+        return new_color
+
+    def _clear_fbg_peak_colors(self):
+        """
+        Limpa o mapa de cores dos picos FBG (útil para reset de análise).
+        
+        """
+        self.fbg_peak_color_map.clear()
+
+    def _apply_fiber_mode(self):
+        """
+        Aplica as configurações específicas para o tipo de fibra selecionado.
+        
+        """
+        fiber = self.config_data.get('fiber')
+        is_fbg = fiber == 'FBG'
+        is_peak_mode = fiber in ('FBG', 'Interferômetro')
+        self.actionPeaks.setEnabled(is_peak_mode)
+        w = 'picos' if is_fbg else 'vales'
+        self.actionPeaks.setText(f'Encontrar {w}')
+        self.roi_region.setVisible(not is_fbg)
+        self.temporal_roi_region.setVisible(not is_fbg)
+        if is_peak_mode:
+            self.roi_range = None
+            self._clear_fbg_peak_colors()  # Limpa mapa de cores ao mudar para modo com séries recorrentes
 
     def _setup_merge_plots(self):
         """
@@ -308,55 +809,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 channel_plot.plot(x_vals, y_vals, pen=pg.mkPen(trace_color, width=1))
                 first_trace = False
 
-    def setup_connections(self):
-        """
-        Conecta os sinais dos widgets (eventos) aos seus respectivos slots (métodos).
-
-        """
-        self.stop_btn.clicked.connect(self.toggle_thread) # Inicia/Para a aquisição de dados
-        self.save_btn.clicked.connect(self.save_data) # Salva os dados processados
-        self.clear_btn.clicked.connect(self.clear_plot) # Limpa os gráficos
-        self.apodization_btn.clicked.connect(self.select_apodization_method)
-        self.savgol_btn.clicked.connect(self.select_savgol_parameters)
-        self.mean_btn.clicked.connect(self.select_mean_samples)
-        self.temporal_roi_region.sigRegionChanged.connect(self.roi_changed) # Atualiza o box plot mesmo com a aquisição parada
-        self.roi_region.sigRegionChanged.connect(self._spectrum_roi_changed)
-        
-        # Botões de fixar um espectro
-        for button in self._list_fix_buttons():
-            button.setContextMenuPolicy(Qt.CustomContextMenu)
-            button.customContextMenuRequested.connect(lambda pos, btn=button: self.toggle_fix(btn, pos))
-            button.clicked.connect(lambda b, btn=button: self.fix_btn_clicked(btn, btn.isChecked()))
-
-        self.actionM.triggered.connect(lambda: self.unit_changed('m'))
-        self.actionUm.triggered.connect(lambda: self.unit_changed('um'))
-        self.actionNm.triggered.connect(lambda: self.unit_changed('nm'))
-        self.actionPm.triggered.connect(lambda: self.unit_changed('pm'))
-        self.actionLight.triggered.connect(lambda: self.set_theme('light'))
-        self.actionDark.triggered.connect(lambda: self.set_theme('dark'))
-        self.actionHelp.triggered.connect(lambda: webbrowser.open(
-            'https://github.com/pedroproprio/online_process_timeseries/blob/main/README.md'))
-        self.actionOpenFile.triggered.connect(self.open_file)
-        self.actionNewWindow.triggered.connect(self.open_new_window)
-
-        # Toggle
-        self.continuous_chk = ToggleSwitch(self.continuous_hlay)
-
-        # Conecta atalhos do teclado
-        self.actionOpenFile.setShortcut('Ctrl+A')
-        self.actionNewWindow.setShortcut('Ctrl+N')
-        self.stop_btn.setShortcut('Return')
-        self.clear_btn.setShortcut('Ctrl+L')
-        self.save_btn.setShortcut('Ctrl+S')
-        self.apodization_btn.setShortcut('A')
-        self.savgol_btn.setShortcut('S')
-        self.mean_btn.setShortcut('M')
-        for i, button in enumerate(self._list_fix_buttons()):
-            button.setShortcut(f'{i+1}') # Atalhos 1-6 para fixar espectros
-
-        # Tabs
-        self.tabWidget.currentChanged.connect(self._on_tab_changed)
-
     def _default_channel_state(self) -> dict:
         """
         Retorna o estado inicial padrão para um canal/aba, 
@@ -369,9 +821,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             'spectra_data': None,
             'roi_range': None,
             'temporal_roi_range': None,
-            'results_df': {'Timestamp': [], 'Intensidade': [], 'Vale': []},
+            'results_df': self._empty_result_store(),
             'samples': {},
-            'pending_hdf5': {'Timestamp': [], 'Intensidade': [], 'Vale': []},
+            'pending_hdf5': self._empty_result_store(),
             'fixed_traces': {},
             'active_traces': [],
             'error_messages': [],
@@ -418,7 +870,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.channel_states[self.active_channel_idx] = {
             'spectra_data': self.spectra_data or [],
             'roi_range': self.roi_range,
-            'temporal_roi_range': self.temporal_roi_region.getRegion() if self.temporal_roi_region is not None else None,
+            'temporal_roi_range': self.temporal_roi_region.getRegion(),
             'results_df': self.results_df,
             'samples': self.samples,
             'pending_hdf5': self.pending_hdf5,
@@ -440,13 +892,17 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.roi_range = state['roi_range']
         temporal_roi_range = state.get('temporal_roi_range')
         self.results_df = state['results_df']
+        self.results_df.setdefault('Vale', [])
+        self.results_df.setdefault('Picos', [])
         self.samples = state['samples']
         self.pending_hdf5 = state['pending_hdf5']
+        self.pending_hdf5.setdefault('Vale', [])
+        self.pending_hdf5.setdefault('Picos', [])
         self.fixed_traces = state['fixed_traces']
         self.active_traces = state['active_traces']
         self.error_messages = state['error_messages']
 
-        if temporal_roi_range is not None and self.temporal_roi_region is not None:
+        if temporal_roi_range is not None:
             self.temporal_roi_region.setRegion(temporal_roi_range)
 
         self._sync_fix_buttons_ui()
@@ -600,6 +1056,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         self.apodization = None if selected == 'None' else selected
         logger.info(f"Método de apodização selecionado: {self.apodization or 'None'}")
+        self._save_persistent_settings()
 
         if self.spectra_data:
             x, y = zip(*self.spectra_data)
@@ -616,7 +1073,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         layout = QFormLayout(dialog)
 
         window_spin = QSpinBox(dialog)
-        window_spin.setRange(3, 1000)
+        window_spin.setRange(0, 1000)
         window_spin.setSingleStep(2)
         window_spin.setValue(self.savgol_window_points)
 
@@ -640,15 +1097,16 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         polyorder = int(poly_spin.value())
 
         if window_points % 2 == 0:
-            window_points -= 1
+            window_points = max(0, window_points - 1)  # Garante que seja ímpar e positivo
 
-        if polyorder >= window_points:
-            QMessageBox.warning(self, 'Filtro Savitzky-Golay', 'O grau do polinômio deve ser menor que o número de pontos da janela.')
+        if polyorder >= window_points and window_points > 0:
+            QMessageBox.warning(self, 'Filtro Savitzky-Golay', 'O grau do polinômio deve ser menor que o número de inflec da janela.')
             return
 
         self.savgol_window_points = window_points
         self.savgol_polyorder = polyorder
         logger.info(f"Filtro Savitzky-Golay configurado: janela={self.savgol_window_points}, polinômio={self.savgol_polyorder}")
+        self._save_persistent_settings()
 
         if self.spectra_data:
             x, y = zip(*self.spectra_data)
@@ -665,7 +1123,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             'Número de espectros:',
             self.mean_samples,
             1,
-            1000,
+            1000 if self.config_data.get('inter') != 'BRAGGMETER FS22DI HBM' else 1,
             1,
         )
         if not accepted:
@@ -673,6 +1131,67 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         self.mean_samples = int(value)
         logger.info(f"Número de amostras para mean configurado: {self.mean_samples}")
+        self._save_persistent_settings()
+
+    def select_peak_parameters(self):
+        """
+        Abre um diálogo para ajustar os parâmetros de detecção.
+        
+        Parâmetros:
+        - Prominência: altura mínima do pico em dBm
+        - Largura: largura mínima do pico em inflec (samples)
+        - Distância: distância mínima entre picos em inflec (samples)
+
+        """
+        is_int = self.config_data.get('fiber') == 'Interferômetro'
+        feature_label = 'vales' if is_int else 'picos'
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f'Detecção de {feature_label}')
+        layout = QFormLayout(dialog)
+
+        prominence_spin = QDoubleSpinBox(dialog)
+        prominence_spin.setRange(0.0, 100_000)
+        prominence_spin.setDecimals(2)
+        prominence_spin.setLocale(QLocale(QLocale.English)) # Separador decimal como ponto
+        prominence_spin.setValue(float(self.peak_detection_params['prominence']))
+
+        width_spin = QDoubleSpinBox(dialog)
+        width_spin.setRange(0.0, 100_000)
+        width_spin.setDecimals(3)
+        width_spin.setLocale(QLocale(QLocale.English)) # Separador decimal como ponto
+        width_spin.setValue(float(self.peak_detection_params['width']))
+
+        distance_spin = QSpinBox(dialog)
+        distance_spin.setRange(1, 100_000)
+        distance_spin.setValue(int(self.peak_detection_params['distance']))
+
+        layout.addRow('Prominência (dBm):', prominence_spin)
+        layout.addRow('Largura (inflec):', width_spin)
+        layout.addRow('Distância (inflec):', distance_spin)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+        layout.addRow(buttons)
+
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        self.peak_detection_params = {
+            'prominence': float(prominence_spin.value()),
+            'width': float(width_spin.value()),
+            'distance': int(distance_spin.value()),
+        }
+        self._save_persistent_settings()
+        logger.info(
+            "Parâmetros de %s configurados: prominence=%s dBm, width=%s pt, distance=%s pt",
+            'vale' if is_int else 'pico',
+            self.peak_detection_params['prominence'],
+            self.peak_detection_params['width'],
+            self.peak_detection_params['distance'],
+        )
 
     def _visible_spectrum_brush(self, x_values: np.ndarray):
         """
@@ -787,12 +1306,16 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         if theme not in ('light', 'dark'):
             return
-        if theme == self.theme:
+        if self.config_data is None:
+            self.config_data = {}
+        self.theme = theme
+        if theme == self.config_data.get('theme') and self.theme_colors:
             self.actionLight.setChecked(theme == 'light')
             self.actionDark.setChecked(theme == 'dark')
+            self._save_persistent_settings()
             return
 
-        self.theme = theme
+        self.config_data['theme'] = theme
         if theme == 'dark':
             self.theme_colors = {
                 'plot_bg': '#0b1220',
@@ -855,7 +1378,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         if self.results_df['Timestamp']:
             self._update_plots_with_results()
 
+        self._setup_merge_plots()
         self._refresh_merge_views()
+        self._save_persistent_settings()
 
     def open_file(self):
         """
@@ -899,6 +1424,26 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             config_data (Dict): Dicionário contendo os parâmetros de configuração.
             
         """
+        self.config_data = config
+        self.config_data['theme'] = self.theme
+ 
+        # Aplica o tema
+        self.set_theme(self.theme)
+
+        # Aplica a unidade persistida do eixo X
+        self.actionM.setChecked(self.xUnit == 'm')
+        self.actionUm.setChecked(self.xUnit == 'um')
+        self.actionNm.setChecked(self.xUnit == 'nm')
+        self.actionPm.setChecked(self.xUnit == 'pm')
+        self._set_spectrum_axis_unit()
+
+        # Ajusta a unidade do eixo y
+        inter = config.get('inter')
+        if inter in ('IBSEN IMON-512', 'BRAGGMETER FS22DI HBM'):
+            self.spectraPlotWidget.setLabel('left', 'Potência', units='u.a.')
+        if inter in ('BRAGGMETER FS22DI HBM'):
+            self.mean_samples = 1
+
         channels = config.get('channels')
         merge_index = self.tabWidget.indexOf(getattr(self, 'tab_merge'))
         channel_tabs = [i for i in range(self.tabWidget.count()) if i != merge_index]
@@ -915,10 +1460,13 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         first_enabled = self.enabled_channels[0] if self.enabled_channels else 0
         self.tabWidget.setCurrentIndex(first_enabled)
         self._restore_channel_state(first_enabled)
+        self._apply_fiber_mode()
+        if self.config_data.get('fiber') != 'FBG':
+            self._restore_roi_for_current_mode()
         self._refresh_active_channel_view()
         self._refresh_merge_views()
+        self._save_persistent_settings()
 
-        self.config_data = config
         self._run()
         QApplication.instance().restoreOverrideCursor()
 
@@ -967,11 +1515,30 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 x_new = np.asarray(x_old, dtype=float) * scale_old_to_new
                 fixed_traces[btn] = (x_new, np.asarray(y_vals, dtype=float))
 
+            results_df = state.get('results_df', {})
+            if 'Vale' in results_df and results_df.get('Vale'):
+                results_df['Vale'] = [float(value) * scale_old_to_new for value in results_df['Vale']]
+            if 'Picos' in results_df and results_df.get('Picos'):
+                results_df['Picos'] = [
+                    [float(value) * scale_old_to_new for value in peak_values]
+                    for peak_values in results_df['Picos']
+                ]
+
+            pending_hdf5 = state.get('pending_hdf5', {})
+            if 'Vale' in pending_hdf5 and pending_hdf5.get('Vale'):
+                pending_hdf5['Vale'] = [float(value) * scale_old_to_new for value in pending_hdf5['Vale']]
+            if 'Picos' in pending_hdf5 and pending_hdf5.get('Picos'):
+                pending_hdf5['Picos'] = [
+                    [float(value) * scale_old_to_new for value in peak_values]
+                    for peak_values in pending_hdf5['Picos']
+                ]
+
             if tab_idx == self.active_channel_idx:
                 self._restore_channel_state(tab_idx)
 
         self._refresh_active_channel_view()
         self._refresh_merge_views()
+        self._save_persistent_settings()
 
     def _run(self):
         """
@@ -980,6 +1547,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         if self.thread is not None:
             return
+
+        self.sample_rate = int(self.sr_spin.value())
+        self._save_persistent_settings()
             
         port = self.config_data.get('port')
         inter = self.config_data.get('inter')
@@ -1026,7 +1596,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.sr_lbl.setEnabled(False)
         self.continuous_chk.setEnabled(False)
         self.continuous_lbl.setEnabled(False)
-        self.sample_rate = self.sr_spin.value() # Atualiza o intervalo entre amostras
 
     def _thread_started(self):
         """
@@ -1396,18 +1965,17 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         Atualiza o box plot mesmo com a aquisição parada.
         
         """
-        if self.temporal_roi_region is not None:
-            self.channel_states[self.active_channel_idx]['temporal_roi_range'] = self.temporal_roi_region.getRegion()
+        self.channel_states[self.active_channel_idx]['temporal_roi_range'] = self.temporal_roi_region.getRegion()
 
         if self.timer is None or not self.timer.isActive():
             self._update_plots_with_results()
 
     def _spectrum_roi_changed(self):
-        if self.roi_region is not None:
-            roi_min, roi_max = self.roi_region.getRegion()
-            self.roi_range = [roi_min, roi_max]
-            if self.active_channel_idx in self.channel_states:
-                self.channel_states[self.active_channel_idx]['roi_range'] = self.roi_range
+        roi_min, roi_max = self.roi_region.getRegion()
+        self.roi_range = [roi_min, roi_max]
+        self._save_roi_for_current_mode()
+        if self.active_channel_idx in self.channel_states:
+            self.channel_states[self.active_channel_idx]['roi_range'] = self.roi_range
 
     def toggle_thread(self):
         """
@@ -1478,20 +2046,22 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
                 intensities = np.asarray(pending['Intensidade'], dtype=np.float32)
                 timestamps = np.asarray(pending['Timestamp'], dtype=np.float64)
-                valleys = np.asarray(pending['Vale'], dtype=np.float64)
+                result_key = self._result_key()
+                values = pending[result_key]
 
-                append_hdf5_samples(
+                append_samples(
                     range_cfg=self.config_data.get('range'),
                     res=self.config_data.get('res'),
                     file_path=file_path,
                     inter=inter,
                     intensities=intensities,
                     timestamps=timestamps,
-                    valleys=valleys,
-                    sample_name=self.sample_name or "Atual"
+                    values=values,
+                    sample_name=self.sample_name or "Atual",
+                    dataset_name=result_key,
                 )
 
-                state['pending_hdf5'] = {'Timestamp': [], 'Intensidade': [], 'Vale': []}
+                state['pending_hdf5'] = self._empty_result_store()
                 if idx == self.active_channel_idx:
                     self.pending_hdf5 = state['pending_hdf5']
                 logger.debug(f"Flush contínuo realizado no canal {idx + 1} com {pending_count} registro(s).")
@@ -1532,13 +2102,15 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.spectra_data = list(zip(x, y))
         self._plot_spectrum_curve(x, y)
 
-        if self.roi_range is None:
+        if not self.config_data.get('fiber') == 'FBG' and self.roi_range is None:
             x_min = min(x)
             x_max = max(x)
             x_range = x_max - x_min
-            self.roi_range = [(x_min+0.25*x_range), x_max-0.25*x_range] # Intervalo fixo
+            self.roi_range = [(x_min+0.25*x_range), (x_max-0.25*x_range)] # Intervalo fixo
             self.roi_region.setRegion(self.roi_range)
             logger.debug(f"ROI inicial definida para: {self.roi_range}")
+        elif self.config_data.get('fiber') == 'FBG':
+            self.roi_range = None
 
         self.process_spectra()
 
@@ -1555,62 +2127,125 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         if not self.spectra_data:
             logger.warning("Não há espectros carregados para processar.")
             return
-        
-        # 1. Obtém os limites da ROI selecionada pelo usuário
-        roi_min, roi_max = self.roi_region.getRegion()
-        logger.info(f"Processando espectros dentro da ROI: {roi_min:.2f} a {roi_max:.2f}")
 
-        # 2. Processa o espectro atual
+        # 1. Processa o espectro atual
         wavelength, power = zip(*self.spectra_data)
         wavelength = np.asarray(wavelength, dtype=float)
         power = np.asarray(power, dtype=float)
 
+        # Aplica o mesmo pré-processamento configurado na visualização antes das análises.
+        # Isso garante consistência entre o que é visto e o que é usado em find_peaks/fit.
+        power_processed = preprocess_plot_data(
+            power,
+            self.apodization_methods,
+            self.savgol_window_points,
+            self.savgol_polyorder,
+            self.apodization,
+        )
+
         # Wavelength em metros para o processamento
         display_to_m = self._unit_to_meter_factor(self.xUnit)
-        roi_m_min = roi_min * display_to_m
-        roi_m_max = roi_max * display_to_m
         wavelength *= display_to_m
 
-        # 3. Chama a função do backend para encontrar o pico
-        res_wl = find_resonant_wavelength(np.array(wavelength), np.array(power), roi_m_min, roi_m_max)
-        
-        # 4. Adiciona o resultado ao dicionário se um pico for encontrado
-        if res_wl is not None:
-            res_wl = float(res_wl)
-            if len(self.results_df['Timestamp']) == 1:
-                 self.spectraPlotWidget.autoRange() # Ajusta o gráfico na primeira medição
-            now = datetime.now().timestamp()
+        interp_fn = interp1d(
+            wavelength,
+            power_processed,
+            kind='linear',
+            bounds_error=False,
+            fill_value=(power_processed[0], power_processed[-1])
+        )
+        intensities = np.asarray(interp_fn(self.fixed_wavelengths), dtype=np.float32)
+        now = datetime.now().timestamp()
 
-            interp_fn = interp1d(
-                wavelength,
-                power,
-                kind='linear',
-                bounds_error=False,
-                fill_value=(power[0], power[-1])
-            )
-            intensities = np.asarray(interp_fn(self.fixed_wavelengths), dtype=np.float32)
+        fiber_type = self.config_data.get('fiber')
+        if fiber_type in ('FBG', 'Interferômetro'):
+            # No modo Interferômetro, restringe a detecção à ROI espectral selecionada.
+            if fiber_type == 'Interferômetro':
+                roi_min, roi_max = self.roi_region.getRegion()
+                logger.debug(f"Processando espectros dentro da ROI: {roi_min:.2f} a {roi_max:.2f}")
+                roi_m_min = roi_min * display_to_m
+                roi_m_max = roi_max * display_to_m
+                roi_mask = (wavelength >= roi_m_min) & (wavelength <= roi_m_max)
+                wl_for_detection = wavelength[roi_mask]
+                power_for_detection = power_processed[roi_mask]
+            else:
+                wl_for_detection = wavelength
+                power_for_detection = power_processed
+
+            if wl_for_detection.size == 0:
+                logger.warning("ROI espectral vazia: nenhuma amostra disponível para detecção de picos/vales.")
+                peak_results = []
+            else:
+                peak_results = find_wavelength_peaks(
+                    wl_for_detection,
+                    power_for_detection,
+                    prominence=self.peak_detection_params['prominence'],
+                    distance=self.peak_detection_params['distance'],
+                    width=self.peak_detection_params['width'],
+                    valley=(fiber_type == 'Interferômetro'),
+                    fit_model='lorentz' if fiber_type == 'Interferômetro' else 'gaussian',
+                ) or []
+
+            peak_values = [float(item['wavelength']) for item in peak_results]
 
             self.results_df['Timestamp'].append(now)
             self.results_df['Intensidade'].append(intensities)
-            self.results_df['Vale'].append(res_wl)
+            self.results_df['Picos'].append(peak_values)
 
-            # Mantém apenas parte do histórico em memória para evitar degradação da UI.
             if self.continuous_chk.isChecked() and len(self.results_df['Timestamp']) > self.max_live_points:
                 excess = len(self.results_df['Timestamp']) - self.max_live_points
                 self.results_df['Timestamp'] = self.results_df['Timestamp'][excess:]
                 self.results_df['Intensidade'] = self.results_df['Intensidade'][excess:]
-                self.results_df['Vale'] = self.results_df['Vale'][excess:]
+                self.results_df['Picos'] = self.results_df['Picos'][excess:]
 
             if self.continuous_chk.isChecked():
                 self.pending_hdf5['Timestamp'].append(now)
                 self.pending_hdf5['Intensidade'].append(intensities)
-                self.pending_hdf5['Vale'].append(res_wl)
+                self.pending_hdf5['Picos'].append(peak_values)
                 self._flush_continuous_buffer()
 
-                logger.debug(f"Dado salvo automaticamente")
+            if len(self.results_df['Timestamp']) == 1:
+                self.spectraPlotWidget.autoRange() # Ajusta o zoom na primeira aquisição
+            logger.debug(f"Processamento {fiber_type} concluído. Total de {len(self.results_df['Timestamp'])} medições acumuladas.")
+            logger.debug(f"Último conjunto detectado ({'vales' if fiber_type == 'Interferômetro' else 'picos'}): {peak_values}")
+        else:
+            # 2. Obtém os limites da ROI selecionada pelo usuário
+            roi_min, roi_max = self.roi_region.getRegion()
+            logger.debug(f"Processando espectros dentro da ROI: {roi_min:.2f} a {roi_max:.2f}")
 
-        logger.info(f"Processamento concluído. Total de {len(self.results_df['Timestamp'])} medições acumuladas.")
-        logger.debug(f"Último pico detectado: {res_wl} m, Total de medições: {len(self.results_df['Timestamp'])}")
+            roi_m_min = roi_min * display_to_m
+            roi_m_max = roi_max * display_to_m
+
+            # 3. Chama a função do backend para encontrar o pico
+            res_wl = find_resonant_wavelength(np.array(wavelength), np.array(power_processed), roi_m_min, roi_m_max)
+            
+            # 4. Adiciona o resultado ao dicionário se um pico for encontrado
+            if res_wl is not None:
+                res_wl = float(res_wl)
+                if len(self.results_df['Timestamp']) == 1:
+                     self.spectraPlotWidget.autoRange() # Ajusta o zoom na primeira aquisição
+
+                self.results_df['Timestamp'].append(now)
+                self.results_df['Intensidade'].append(intensities)
+                self.results_df['Vale'].append(res_wl)
+
+                # Mantém apenas parte do histórico em memória para evitar degradação da UI.
+                if self.continuous_chk.isChecked() and len(self.results_df['Timestamp']) > self.max_live_points:
+                    excess = len(self.results_df['Timestamp']) - self.max_live_points
+                    self.results_df['Timestamp'] = self.results_df['Timestamp'][excess:]
+                    self.results_df['Intensidade'] = self.results_df['Intensidade'][excess:]
+                    self.results_df['Vale'] = self.results_df['Vale'][excess:]
+
+                if self.continuous_chk.isChecked():
+                    self.pending_hdf5['Timestamp'].append(now)
+                    self.pending_hdf5['Intensidade'].append(intensities)
+                    self.pending_hdf5['Vale'].append(res_wl)
+                    self._flush_continuous_buffer()
+
+                    logger.debug(f"Dado salvo automaticamente")
+
+            logger.debug(f"Processamento concluído. Total de {len(self.results_df['Timestamp'])} medições acumuladas.")
+            logger.debug(f"Último pico detectado: {locals().get('res_wl')} m, Total de medições: {len(self.results_df['Timestamp'])}")
 
         # 5. Chama a função para atualizar os gráficos com os resultados
         self._update_plots_with_results()
@@ -1618,7 +2253,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
     def _update_plots_with_results(self):
         """
         Atualiza os gráficos para exibir os resultados processados.
-        - Plota os pontos no gráfico de evolução temporal.
+        - Plota os inflec no gráfico de evolução temporal.
         - Desenha linhas verticais nos picos encontrados no gráfico de espectros.
         
         """
@@ -1629,17 +2264,85 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.update_box_plot()
             return
 
+        timestamps_numeric = self.results_df['Timestamp']
+
         # --- Atualiza Gráfico 2: Evolução Temporal ---
         self.temporalPlotWidget.clear()
-        
-        # pyqtgraph precisa de timestamps numéricos (Unix timestamp) para o eixo de datas
-        timestamps_numeric = self.results_df['Timestamp']
+        self.temporalPlotWidget.addItem(self.temporal_roi_region)
+
+        if self.config_data.get('fiber') in ('FBG', 'Interferômetro'):
+            peak_series = self.results_df['Picos']
+            is_int = self.config_data.get('fiber') == 'Interferômetro'
+
+            # Apenas picos recorrentes devem persistir em temporal/box (ruído momentâneo é descartado)
+            recurring_groups = self._recurring_fbg_peak_groups(timestamps_numeric, peak_series, min_count=2)
+
+            # Plota cada pico recorrente rastreado com sua cor consistente
+            for peak_wavelength, points in recurring_groups.items():
+                x_points = [pt[0] for pt in points]
+                y_values_m = [pt[1] for pt in points]
+
+                if x_points:
+                    color = self._get_fbg_peak_color(peak_wavelength)
+                    y_points = self._from_meter(y_values_m, self.resultUnit)
+                    self.temporalPlotWidget.plot(
+                        x=x_points,
+                        y=y_points,
+                        pen=pg.mkPen(color, width=1),
+                        symbol='o',
+                        symbolBrush=color,
+                        symbolSize=7,
+                    )
+
+            if self.timer is not None and timestamps_numeric:
+                roi_min = timestamps_numeric[0]
+                roi_max = timestamps_numeric[-1]
+                self.temporal_roi_region.setRegion((roi_min, roi_max))
+                logger.debug(f"ROI temporal ajustada no intervalo: {roi_min} a {roi_max}")
+
+            logger.debug("Gráfico FBG de evolução temporal atualizado.")
+
+            # Atualiza linhas verticais no gráfico de espectros para os últimos picos
+            for item in list(self.spectraPlotWidget.items()):
+                if isinstance(item, pg.InfiniteLine):
+                    self.spectraPlotWidget.removeItem(item)
+
+            if self.results_df['Picos']:
+                last_peaks = self.results_df['Picos'][-1]
+                if last_peaks:
+                    # Ordena os picos por wavelength
+                    sorted_peaks = sorted(last_peaks)
+                    for peak_value in sorted_peaks:
+                        # Mantém destaque de pico apenas para grupos recorrentes.
+                        match_key = self._find_matching_peak_key(recurring_groups, peak_value)
+                        color = self._get_fbg_peak_color(match_key) if match_key is not None else self.theme_colors['accent']
+                        line = pg.InfiniteLine(
+                            pos=self._from_meter([peak_value], self.xUnit)[0],
+                            angle=90,
+                            movable=False,
+                            pen={'color': color, 'style': pg.QtCore.Qt.DashLine}
+                        )
+                        self.spectraPlotWidget.addItem(line)
+            logger.debug("Marcadores de %s adicionados ao gráfico de espectros.", 'vale' if is_int else 'pico')
+
+            current_peak_samples = self._fbg_current_peak_samples(
+                timestamps_numeric,
+                peak_series,
+                label_prefix="Atual",
+                feature_label="Vale" if is_int else "Pico",
+            )
+
+            if current_peak_samples:
+                self.update_box_plot(current_peak_samples=current_peak_samples, same_sample=True)
+            elif self.samples:
+                self.update_box_plot()
+            return
 
         valleys_m = np.asarray(self.results_df['Vale'], dtype=float)
         resonant_temporal = self._from_meter(valleys_m, self.resultUnit)
         resonant_spectrum = self._from_meter(valleys_m, self.xUnit)
-        
-        # Plota os pontos e uma linha conectando-os
+
+        # Plota os inflec e uma linha conectando-os
         self.temporalPlotWidget.plot(
             x=timestamps_numeric,
             y=resonant_temporal,
@@ -1655,10 +2358,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self.temporal_roi_region.setRegion((roi_min, roi_max)) # Ajusta a ROI temporal
             logger.debug(f"ROI temporal ajustada no intervalo: {roi_min} a {roi_max}")
 
-        self.temporalPlotWidget.addItem(self.temporal_roi_region)
-        
         logger.debug("Gráfico de evolução temporal atualizado.")
-        
+
         # --- Atualiza Gráfico 1: Adiciona Marcadores de Pico ---
         # Primeiro, remove marcadores antigos (se existirem)
         for item in self.spectraPlotWidget.items():
@@ -1674,7 +2375,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         )
         self.spectraPlotWidget.addItem(line)
         logger.debug(f"Marcador de pico adicionado ao gráfico de espectros.")
-        
+
         # Seleciona a ROI temporal atual para filtrar os dados computados pelo box plot
         roi_min_ts, roi_max_ts = self.temporal_roi_region.getRegion()
         mask = [(r >= roi_min_ts) and (r <= roi_max_ts) for r in timestamps_numeric]
@@ -1686,24 +2387,48 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         self.update_box_plot(boxplot_valleys)
 
-    def update_box_plot(self, boxplot_valleys: list = None):
+    def update_box_plot(self, boxplot_valleys: list = None, current_peak_samples: list[tuple[str, tuple]] | None = None, same_sample: bool = False):
         """
         Atualiza o box plot com os dados processados.
         Args:
             boxplot_valleys (list): Lista de valores com as estatísticas para o box plot.
+            current_peak_samples (list[tuple[str, tuple]] | None): Lista de boxplots atuais já agregados por pico.
+            same_sample (bool): Mantido por retrocompatibilidade.
             
         """
         self.boxPlot.clear()
         self.boxLegend.clear()
 
-        samples = list(self.samples.items())
-        if boxplot_valleys:
+        samples = self._expand_samples_for_boxplot()
+        if current_peak_samples:
+            samples.extend(current_peak_samples)
+        elif boxplot_valleys is not None:
             samples.append(("Atual", self.box_plot_statistics(boxplot_valleys)))
 
+        def _sample_group_key(label: str) -> str:
+            if " - Pico " in label:
+                return label.split(" - Pico ", 1)[0]
+            if " - Vale " in label:
+                return label.split(" - Vale ", 1)[0]
+            return label
+
+        intra_sample_gap = 0.75
+        inter_sample_gap = 1.9
+        box_width = 0.5
+
         y_values = []
+        prev_group = None
+        x_center = 1.0
+
         for i, (sample_name, stats) in enumerate(samples):
             q1, q2, q3, lower_whisker, upper_whisker, outliers = stats
             y_values.extend([q1, q2, q3, lower_whisker, upper_whisker]) # amostras anteriores
+
+            current_group = _sample_group_key(sample_name)
+            if i > 0:
+                same_group = current_group == prev_group
+                x_center += intra_sample_gap if same_group else inter_sample_gap
+            prev_group = current_group
 
             # Cores alternadas para os box plots
             rgb = [(50*i if (i%3) == 1 else 0) % 250,
@@ -1712,7 +2437,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
             # --- Desenho do box plot ---
             # Retângulo entre Q1 e Q3
-            box = QGraphicsRectItem(0.75+i, q1, 0.5, q3-q1)
+            box = QGraphicsRectItem(x_center - box_width / 2, q1, box_width, q3-q1)
             box.setPen(pg.mkPen('k'))
             box.setBrush(pg.mkBrush(rgb)) # cores alternadas
             self.boxPlot.addItem(box)
@@ -1722,20 +2447,20 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self.boxLegend.addItem(legend, sample_name)
 
             # Linha da mediana
-            self.boxPlot.plot([0.75+i, 1.25+i], [q2, q2], pen=pg.mkPen(self.theme_colors['accent'], width=2))
+            self.boxPlot.plot([x_center - box_width / 2, x_center + box_width / 2], [q2, q2], pen=pg.mkPen(self.theme_colors['accent'], width=2))
             #Linha vertical
-            self.boxPlot.plot([1.0+i, 1.0+i], [q1, q3], pen='k')
+            self.boxPlot.plot([x_center, x_center], [q1, q3], pen='k')
             # Whiskers (linhas verticais dos limites)
-            self.boxPlot.plot([1.0+i, 1.0+i], [q3, upper_whisker], pen='k')
-            self.boxPlot.plot([1.0+i, 1.0+i], [q1, lower_whisker], pen='k')
+            self.boxPlot.plot([x_center, x_center], [q3, upper_whisker], pen='k')
+            self.boxPlot.plot([x_center, x_center], [q1, lower_whisker], pen='k')
             # Topo e base dos whiskers
-            self.boxPlot.plot([0.85+i, 1.15+i], [upper_whisker, upper_whisker], pen=pg.mkPen(self.theme_colors['spectrum']))
-            self.boxPlot.plot([0.85+i, 1.15+i], [lower_whisker, lower_whisker], pen=pg.mkPen(self.theme_colors['spectrum']))
+            self.boxPlot.plot([x_center - 0.15, x_center + 0.15], [upper_whisker, upper_whisker], pen=pg.mkPen(self.theme_colors['spectrum']))
+            self.boxPlot.plot([x_center - 0.15, x_center + 0.15], [lower_whisker, lower_whisker], pen=pg.mkPen(self.theme_colors['spectrum']))
 
             # Outliers (se existirem)
             if len(outliers) > 0:
                 self.boxPlot.plot(
-                    np.ones(len(outliers))*(1.0+i),
+                    np.ones(len(outliers)) * x_center,
                     outliers,
                     pen=None,
                     symbol='o',
@@ -1781,8 +2506,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.spectraPlotWidget.addItem(self.roi_region)
         self.temporalPlotWidget.clear()
         self.temporalPlotWidget.addItem(self.temporal_roi_region)
-        self.results_df = {'Timestamp': [], 'Intensidade': [], 'Vale': []}
-        self.pending_hdf5 = {'Timestamp': [], 'Intensidade': [], 'Vale': []}
+        self.results_df = self._empty_result_store()
+        self.pending_hdf5 = self._empty_result_store()
+        self._clear_fbg_peak_colors()
         self.spectra_data = []
         self.roi_range = None
         self.fixed_traces = {}
@@ -1852,40 +2578,52 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         # --- Passo 4: Processa e filtra os dados da ROI ---
         try:
-            roi_min_ts, roi_max_ts = self.temporal_roi_region.getRegion()
-
             timestamps = np.asarray(self.results_df['Timestamp'], dtype=np.float64)
             intensities = self.results_df['Intensidade']
-            valleys = np.asarray(self.results_df['Vale'], dtype=np.float64)
 
-            
-            mask = (timestamps >= roi_min_ts) & (timestamps <= roi_max_ts)
+            if self.config_data.get('fiber') in ('FBG', 'Interferômetro'):
+                peak_values = self.results_df['Picos']
+                timestamps_filtered = timestamps
+                intensities_filtered = np.asarray(intensities, dtype=np.float32)
+                resonant_filtered = peak_values
 
-            timestamps_filtered = timestamps[mask]
-            intensities_filtered = np.asarray(
-                [intensities[i] for i in range(len(intensities)) if mask[i]],
-                dtype=np.float32
-            )
-            resonant_filtered = valleys[mask]
+                if not self._flatten_peak_values(peak_values):
+                    feature_plural = 'vales' if self.config_data.get('fiber') == 'Interferômetro' else 'picos'
+                    logger.warning("Nenhum %s detectado para salvar.", 'vale' if self.config_data.get('fiber') == 'Interferômetro' else 'pico')
+                    QMessageBox.warning(self, "Atenção", f"Não há {feature_plural} detectados para salvar.")
+                    return
+            else:
+                roi_min_ts, roi_max_ts = self.temporal_roi_region.getRegion()
+                valleys = np.asarray(self.results_df['Vale'], dtype=np.float64)
 
-            if not timestamps_filtered.any():
-                logger.warning("A região selecionada não contém dados para salvar.")
-                QMessageBox.warning(self, "Atenção", "A região selecionada não contém dados para salvar.")
-                return
+                mask = (timestamps >= roi_min_ts) & (timestamps <= roi_max_ts)
+
+                timestamps_filtered = timestamps[mask]
+                intensities_filtered = np.asarray(
+                    [intensities[i] for i in range(len(intensities)) if mask[i]],
+                    dtype=np.float32
+                )
+                resonant_filtered = valleys[mask]
+
+                if not timestamps_filtered.any():
+                    logger.warning("A região selecionada não contém dados para salvar.")
+                    QMessageBox.warning(self, "Atenção", "A região selecionada não contém dados para salvar.")
+                    return
 
             inter = self.config_data.get('inter')
 
             logger.debug(f"Salvando {len(intensities_filtered)} espectros")
 
-            append_hdf5_samples(
+            append_samples(
                 range_cfg=self.config_data.get('range'),
                 res=self.config_data.get('res'),
                 file_path=file_path,
                 inter=inter,
                 intensities=intensities_filtered,
                 timestamps=timestamps_filtered,
-                valleys=resonant_filtered,
-                sample_name=sample_name
+                values=resonant_filtered,
+                sample_name=sample_name,
+                dataset_name=self._result_key(),
             )
 
             logger.info(f"Dados salvos com sucesso em: {file_path}")
@@ -1895,8 +2633,22 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self.file_path = file_path
             self.setWindowTitle(f"Análise de dados - {os.path.basename(file_path)}")
             # Calcula e armazena as estatísticas do box plot na escala configurada
-            resonant_for_box = self._from_meter(resonant_filtered, self.resultUnit)
-            self.samples[sample_name] = self.box_plot_statistics(resonant_for_box)
+            if self.config_data.get('fiber') in ('FBG', 'Interferômetro'):
+                sample_peak_boxes = self._fbg_current_peak_samples(
+                    timestamps_filtered.tolist(),
+                    resonant_filtered,
+                    label_prefix="Pico" if self.config_data.get('fiber') == 'FBG' else "Vale",
+                    feature_label="Pico" if self.config_data.get('fiber') == 'FBG' else "Vale",
+                )
+                if sample_peak_boxes:
+                    self.samples[sample_name] = sample_peak_boxes
+                else:
+                    # Fallback para manter compatibilidade caso não haja recorrência suficiente
+                    resonant_for_box = self._from_meter(self._flatten_peak_values(resonant_filtered), self.resultUnit)
+                    self.samples[sample_name] = self.box_plot_statistics(resonant_for_box)
+            else:
+                resonant_for_box = self._from_meter(resonant_filtered, self.resultUnit)
+                self.samples[sample_name] = self.box_plot_statistics(resonant_for_box)
             self.samples = dict(reversed(self.samples.items())) # Mantém a ordem de inserção (última amostra salva aparece primeiro)
             self._save_active_channel_state()
 
@@ -1914,13 +2666,34 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         try:
             inter = self.config_data.get('inter')
-            data = load_hdf5_samples(file_path, inter)
+            data = load_samples(file_path, inter)
 
-            for sample_name, sample_wavelengths in data.items():
-                sample_wavelengths = np.asarray(sample_wavelengths, dtype=float)
-                sample_wavelengths = self._from_meter(sample_wavelengths, self.resultUnit)
+            for sample_name, sample_payload in data.items():
+                dataset_name = sample_payload.get('dataset')
+                sample_values = sample_payload.get('values', [])
 
-                self.samples[sample_name] = self.box_plot_statistics(sample_wavelengths)
+                if dataset_name == 'Picos':
+                    feature_label = "Vale" if self.config_data.get('fiber') == 'Interferômetro' else "Pico"
+                    # Reconstrói séries para separar boxplots por pico recorrente da mesma amostra
+                    peak_series = [[float(v) for v in np.asarray(row, dtype=float).ravel().tolist()] for row in sample_values]
+                    timestamps = list(range(len(peak_series)))
+                    grouped = self._recurring_fbg_peak_groups(timestamps, peak_series, min_count=2)
+
+                    if grouped:
+                        sample_peak_boxes = []
+                        for i, (_, points) in enumerate(grouped.items(), start=1):
+                            values_m = [wl for _, wl in points]
+                            values_unit = self._from_meter(values_m, self.resultUnit)
+                            sample_peak_boxes.append((f"{feature_label} {i}", self.box_plot_statistics(values_unit)))
+                        self.samples[sample_name] = sample_peak_boxes
+                    else:
+                        flattened = self._flatten_peak_values(peak_series)
+                        sample_wavelengths = self._from_meter(np.asarray(flattened, dtype=float), self.resultUnit)
+                        self.samples[sample_name] = self.box_plot_statistics(sample_wavelengths)
+                else:
+                    sample_wavelengths = np.asarray(sample_values, dtype=float)
+                    sample_wavelengths = self._from_meter(sample_wavelengths, self.resultUnit)
+                    self.samples[sample_name] = self.box_plot_statistics(sample_wavelengths)
 
             if not self.samples:
                 raise ValueError("Nenhum dado de amostra encontrado no arquivo.")
@@ -1986,7 +2759,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.continuous_timer.stop()
             self.continuous_timer.deleteLater()
 
-        self.pending_hdf5 = {'Timestamp': [], 'Intensidade': [], 'Vale': []}
+        self.pending_hdf5 = self._empty_result_store()
         self._save_active_channel_state()
         self.continuous_timer = QTimer(self)
         self.continuous_timer.setSingleShot(True)
@@ -2001,6 +2774,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         para que a janela de configuração possa reaparecer.
         
         """
+        self._save_persistent_settings()
         self._cleanup_thread()
         super().closeEvent(event)
-        self.closing.emit()
+        if isinstance(self.config_data, dict):
+            self.closing.emit(self.config_data.get('theme', self.theme))
+        else:
+            self.closing.emit(self.theme)

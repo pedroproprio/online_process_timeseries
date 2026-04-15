@@ -25,7 +25,7 @@ class Ui_ConfigWindow(object):
         if not ConfigWindow.objectName():
             ConfigWindow.setObjectName(u"ConfigWindow")
         ConfigWindow.setWindowModality(Qt.WindowModality.NonModal)
-        ConfigWindow.resize(569, 323)
+        ConfigWindow.resize(569, 325)
         sizePolicy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
@@ -33,8 +33,6 @@ class Ui_ConfigWindow(object):
         ConfigWindow.setSizePolicy(sizePolicy)
         ConfigWindow.setMinimumSize(QSize(0, 0))
         ConfigWindow.setMaximumSize(QSize(16777215, 16777215))
-        icon = QIcon(QIcon.fromTheme(QIcon.ThemeIcon.DocumentProperties))
-        ConfigWindow.setWindowIcon(icon)
         ConfigWindow.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.centralwidget = QWidget(ConfigWindow)
         self.centralwidget.setObjectName(u"centralwidget")
@@ -91,6 +89,13 @@ class Ui_ConfigWindow(object):
         self.com_lbl.setTextFormat(Qt.TextFormat.PlainText)
 
         self.labels_vlay.addWidget(self.com_lbl)
+
+        self.fiber_lbl = QLabel(self.centralwidget)
+        self.fiber_lbl.setObjectName(u"fiber_lbl")
+        sizePolicy1.setHeightForWidth(self.fiber_lbl.sizePolicy().hasHeightForWidth())
+        self.fiber_lbl.setSizePolicy(sizePolicy1)
+
+        self.labels_vlay.addWidget(self.fiber_lbl)
 
 
         self.main_hlay.addLayout(self.labels_vlay)
@@ -186,6 +191,16 @@ class Ui_ConfigWindow(object):
         self.port_combo.setSizePolicy(sizePolicy1)
 
         self.combos_vlay.addWidget(self.port_combo)
+
+        self.fiber_combo = QComboBox(self.centralwidget)
+        self.fiber_combo.addItem("")
+        self.fiber_combo.addItem("")
+        self.fiber_combo.addItem("")
+        self.fiber_combo.setObjectName(u"fiber_combo")
+        sizePolicy1.setHeightForWidth(self.fiber_combo.sizePolicy().hasHeightForWidth())
+        self.fiber_combo.setSizePolicy(sizePolicy1)
+
+        self.combos_vlay.addWidget(self.fiber_combo)
 
 
         self.main_hlay.addLayout(self.combos_vlay)
@@ -284,11 +299,16 @@ class Ui_ConfigWindow(object):
         self.res_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Resolu\u00e7\u00e3o do comprimento de onda:", None))
         self.ip_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Endere\u00e7o IP:", None))
         self.com_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Porta:", None))
+        self.fiber_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Tipo de fibra:", None))
         self.inter_combo.setCurrentText("")
         self.label_5.setText(QCoreApplication.translate("ConfigWindow", u"-", None))
         self.label_6.setText(QCoreApplication.translate("ConfigWindow", u"nm", None))
         self.label_7.setText(QCoreApplication.translate("ConfigWindow", u"pm", None))
         self.ip_lineEdit.setText(QCoreApplication.translate("ConfigWindow", u"10.0.0.10", None))
+        self.fiber_combo.setItemText(0, QCoreApplication.translate("ConfigWindow", u"LPG", None))
+        self.fiber_combo.setItemText(1, QCoreApplication.translate("ConfigWindow", u"FBG", None))
+        self.fiber_combo.setItemText(2, QCoreApplication.translate("ConfigWindow", u"Interfer\u00f4metro", None))
+
         self.ch_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Canais usados:", None))
         self.ch1_radio.setText(QCoreApplication.translate("ConfigWindow", u"Canal 1", None))
         self.ch2_radio.setText(QCoreApplication.translate("ConfigWindow", u"Canal 2", None))

@@ -86,7 +86,7 @@ class BraggMeter:
                             }
         self.host = host
         self.port = port
-        self.timeout = 2
+        self.timeout = 5
         self.sock = None
 
         self.start()
@@ -110,7 +110,6 @@ class BraggMeter:
         """
         Opens a socket connection to the BraggMeter device.
         """
-        last_error = None
         for attempt in range(3):
             try:
                 if self.sock is not None:
@@ -131,7 +130,7 @@ class BraggMeter:
                 if attempt < 2:
                     logger.warning(
                         f'Failed to open socket to {self.host}:{self.port} on attempt {attempt + 1}/3: {e}. Retrying...')
-                    time.sleep(0.15)
+                    time.sleep(0.1)
                 else:
                     logger.error(f'Failed to open socket to {self.host}:{self.port}: {e}')
                     raise ConnectionError(f'Failed to open socket: {e}') from e
@@ -234,7 +233,7 @@ class BraggMeter:
                 loc = i + 1
         return int(resp[loc])
 
-    def get_osa_trace(self, n_mean: int=1, channel: int=0):
+    def get_osa_trace(self, _, channel: int=0):
         """
         Retrieves the OSA trace data from the specified channel.
 
@@ -246,35 +245,39 @@ class BraggMeter:
             numpy.ndarray: An array containing the wavelength and trace data.
             str: An warning message if the spectrum is saturated, otherwise None.
         """
-        traces_db = []
+        traces = []
         wl = None
         warn = None
 
-        for _ in range(n_mean):
-            resp = self.ask(f'trace{channel}')
-            resp = resp.split(':')
+        resp = self.ask(f'trace{channel}')
+        resp = resp.split(':')
 
-            if self.legacy_cmds:
-                pot = resp[-1]
-                trace_raw = np.array([float(x) for x in pot.split(',')], dtype=float)
-                wl = np.linspace(1500, 1600, len(trace_raw))
-            else:
-                pot, wl_str = resp[-2], resp[-1]
-                hex_values = [pot[i:i+3] for i in range(0, len(pot), 3)]
-                trace_raw = np.array([int(hex_value, 16) for hex_value in hex_values], dtype=float)
-                wl = np.array([float(x) for x in wl_str.split(',')])
-
-            if np.max(trace_raw) == 4095:
-                warn = "Optical connector saturated."
-
-            trace_raw *= -1
-            traces_db.append(trace_raw)
-
-        trace = np.array(traces_db)
-        if n_mean > 1:
-            trace = np.mean(trace, axis=0)
+        if self.legacy_cmds:
+            pot = resp[-1]
+            trace_raw = np.array([float(x) for x in pot.split(',')], dtype=float)
+            wl = np.linspace(1500, 1600, len(trace_raw))
         else:
-            trace = trace[0]
+            pot, wl_str = resp[-2], resp[-1]
+            hex_values = [pot[i:i+3] for i in range(0, len(pot), 3)]
+            trace_raw = np.array([int(hex_value, 16) for hex_value in hex_values], dtype=float)
+            wl = np.array([float(x) for x in wl_str.split(',')])
+
+        if np.max(trace_raw) == 4095:
+            warn = "Optical connector saturated."
+
+        if traces:
+            lengths = [len(trace) for trace in traces]
+            min_len = min(lengths)
+            if len(trace) > min_len:
+                logger.debug(f'Truncating to {min_len} samples.')
+                traces = [trace[:min_len] for trace in traces]
+                wl = wl[:min_len]
+            elif len(trace) < min_len:
+                logger.debug(f'Truncating previous traces to {min_len} samples.')
+                traces = [trace[:len(trace)] for trace in traces]
+                wl = wl[:len(trace)]
+
+        trace = np.array(traces)
 
         spec = np.stack((wl, trace), axis=1)
         spec = np.flipud(spec)
@@ -476,7 +479,7 @@ class Imon512:
                 self.serial_port = None  # Garante que serial_port está None em caso de erro
                 if attempt < 2:
                     logger.warning(f'Failed to open port {self.port} on attempt {attempt + 1}/3: {e}. Retrying...')
-                    time.sleep(0.15)
+                    time.sleep(0.1)
                 else:
                     logger.error(f'Failed to open port {self.port}: {e}')
                     raise e
@@ -489,6 +492,7 @@ class Imon512:
             bytes: The response from the Imon512 device.
 
         """
+        self.serial_port.reset_input_buffer()
         response = self.serial_port.readline()
         return response
 
@@ -516,22 +520,23 @@ class Imon512:
         """
         return self.wl
 
-    def ask(self, command: str, retries=2):
+    def ask(self, command: str):
         """
         Send command to Imon512.
 
         Args:
             command (str): The command to be sent.
         """
+        retries = 2
         string = (command + '\r').encode()
 
-        for attempt in range(retries + 1):
+        for attempt in range(retries):
             if self.serial_port is None or not self.serial_port.is_open:
                 logger.warning('Serial port is not open.')
                 try:
                     self.open()
                 except Exception as e:
-                    logger.warning(f'Failed to open port {self.port} on attempt {attempt + 1}/{retries + 1}: {e}')
+                    logger.warning(f'Failed to open port {self.port} on attempt {attempt + 1}/{retries}: {e}')
                     time.sleep(0.1)
                     continue
 
@@ -550,11 +555,11 @@ class Imon512:
             except (serial.SerialException, AttributeError, OSError) as e:
                 if self.serial_port is not None:
                     logger.warning(
-                        f'Write failed on {self.port} (attempt {attempt + 1}/{retries + 1}): {e}')
+                        f'Write failed on {self.port} (attempt {attempt + 1}/{retries}): {e}')
                     self.close()
                     time.sleep(0.1)
 
-        logger.error(f'Unable to send command to {self.port} after {retries + 1} attempts: {command}')
+        logger.error(f'Unable to send command to {self.port} after {retries} attempts: {command}')
         return False
 
     def update_coefficients(self):
@@ -590,45 +595,44 @@ class Imon512:
 
         Args:
             n_pix (int): The number of pixels.
+        Returns:
+            numpy.ndarray: An array containing the fitted wavelength data.
 
         """
         pix = np.arange(0, n_pix, dtype=float)
         wl = np.zeros_like(pix)
         for n, coef in enumerate(self.wl_param):
             wl += coef * pix ** float(n)
-        self.wl = wl
-        self.temperature_compensation()
+        return self.temperature_compensation(wl)
 
-    def temperature_compensation(self, retries: int=3):
+    def temperature_compensation(self, wl: np.ndarray):
         """
         Compensates the wavelength data for temperature.
-        Updates the wavelength attribute.
+        Args:
+            wl (numpy.ndarray): The wavelength data to be compensated.
+        Returns:
+            numpy.ndarray: An array containing the temperature-compensated wavelength data.
 
         """
         temp = self.temp
         self.ask('*meas:temper')
         try:
-            for _ in range(retries):
-                response = self.listen()
-                decoded = response.decode(errors='ignore')
-                logger.debug(f'Temp response: {decoded}')
-                try:
-                    temp = float(decoded.split('\t')[-1].split('\r')[0].strip())
-                    self.temp = temp
-                    break
-                except ValueError:
-                    time.sleep(0.02)
-                    continue
-                except IndexError as e:
-                    logger.warning(f'Failed to parse temperature response, using cached value: {e}')
-            else:
-                logger.warning('Temperature unavailable; skipping wavelength compensation.')
-                return
+            response = self.listen()
+            decoded = response.decode(errors='ignore')
+            logger.debug(f'Temp response: {decoded}')
+            if 'Temperature:' not in decoded:
+                logger.debug('Temperature unavailable; skipping wavelength compensation.')
+                return wl
+            try:
+                temp = float(decoded.split(':')[-1].split('\r')[0].strip())
+                self.temp = temp
+            except (ValueError, IndexError) as e:
+                logger.warning(f'Failed to parse temperature response, using cached value: {e}')
 
-            self.wl = (self.wl - self.tem_param[2] * temp - self.tem_param[2]) \
+            return (wl - self.tem_param[2] * temp - self.tem_param[2]) \
                       / (1 + self.tem_param[0] * temp + self.tem_param[1])
         except Exception as e:
-            logger.error(f'erro ao compensar a temperatura: {e}')        
+            logger.error(f'Failed to compensate for temperature: {e}')        
 
     def measure(self, n_mean=1, return_spectrum=True):
         """
@@ -645,7 +649,7 @@ class Imon512:
         
         measurements = []
         warn = False
-        self.fit_wavelength(510)
+        self.wl = self.fit_wavelength(510)
         self.ask('*meas:fstmeas')
         for i in range(0, n_mean):
             try:
@@ -667,6 +671,8 @@ class Imon512:
         measurements = np.array(measurements, dtype=float)
         if n_mean > 1:
             measurements = np.mean(measurements, axis=0)
+        else:
+            measurements = measurements[0]
         
         if return_spectrum:
             spectrum = np.stack((self.wl[1::], measurements), axis=1)
@@ -703,7 +709,7 @@ class Imon512:
         for i in range(0, 2*n, 2):
             v = int.from_bytes(streamed_bytes[i:i + 2], byteorder='little')
             values.append(v)
-        warn = np.max(values) > 60000
+        warn = np.max(values) > 48800
         return values, warn
 
     def set_exposure_time(self, et: int):
@@ -938,12 +944,13 @@ class SercaloSwitch:
                 self.serial_port = None
                 if attempt < 2:
                     logger.warning(f'Failed to open port {self.port} on attempt {attempt + 1}/3: {e}. Retrying...')
-                    time.sleep(0.15)
+                    time.sleep(0.1)
                 else:
                     logger.error(f'Failed to open port {self.port}: {e}')
                     raise e
 
-    def ask(self, command: str, retries=1):
+    def ask(self, command: str):
+        retries = 1
         if self.serial_port is None or not self.serial_port.is_open:
             logger.warning("Serial port is not open.")
             self.open()
@@ -956,12 +963,14 @@ class SercaloSwitch:
             logger.error(f'Write failed on {self.port}: {e}. Retrying...')
             if retries > 2:
                 raise ConnectionError(f'Max retries exceeded on write: {e}')
-            self.ask(command, retries+1)
+            self.ask(command, retries)
 
-    def ack(self, timeout=3.0, retries=3):
+    def ack(self):
+        timeout = 2
+        retries = 2
         timeout += time.monotonic()
 
-        for attempt in range(retries + 1):
+        for attempt in range(retries):
             while time.monotonic() < timeout:
                 if self.serial_port is None or not self.serial_port.is_open:
                     return -1
@@ -984,7 +993,7 @@ class SercaloSwitch:
                 timeout += time.monotonic()
 
         raise TimeoutError(
-            f'No response received on Sercalo switch on {self.port} after {retries+1} attempt(s).')
+            f'No response received on Sercalo switch on {self.port} after {retries} attempt(s).')
 
     def set_channel(self, channel: int):
         command = f':set-chan-{channel}'
@@ -992,11 +1001,9 @@ class SercaloSwitch:
         if not self.ack():
             raise RuntimeError(f"Failed to set channel: {channel}")
         
-    def get_channel(self, retries=2, settle_delay=0.05):
-        for attempt in range(retries + 1):
-            if settle_delay > 0:
-                time.sleep(settle_delay)
-
+    def get_channel(self):
+        retries = 2
+        for attempt in range(retries):
             self.ask(':get-chan?')
             timeout = time.monotonic() + 3.0 # 3 seconds timeout
             response = []
@@ -1025,13 +1032,13 @@ class SercaloSwitch:
                         raise RuntimeError(f'Invalid channel response: {response}')
 
                 if ':nack' in response:
-                    logger.warning(f'Failed to get channel on attempt {attempt + 1}/{retries + 1}: {response}')
+                    logger.warning(f'Failed to get channel on attempt {attempt + 1}/{retries}: {response}')
                     break
 
             if attempt < retries:
                 time.sleep(0.05)
 
-        raise RuntimeError(f'Failed to get channel after {retries + 1} attempt(s).')
+        raise RuntimeError(f'Failed to get channel after {retries} attempt(s).')
 
 
 class MultiSercaloSwitch:

@@ -20,7 +20,7 @@ if __name__ == "__main__":
     app.setStyleSheet(qdarktheme.load_stylesheet())
     
     window = ConfigWindow()
-    icon = os.path.join(cur_dir, "img", "logo.png")
+    icon = os.path.join(cur_dir, "img", "litel.png")
     window.setWindowIcon(QIcon(icon))
     window.show()
     

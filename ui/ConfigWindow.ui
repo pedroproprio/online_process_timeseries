@@ -10,7 +10,7 @@
     <x>0</x>
     <y>0</y>
     <width>569</width>
-    <height>323</height>
+    <height>325</height>
    </rect>
   </property>
   <property name="sizePolicy">
@@ -33,9 +33,6 @@
   </property>
   <property name="windowTitle">
    <string>Configuração inicial</string>
-  </property>
-  <property name="windowIcon">
-   <iconset theme="QIcon::ThemeIcon::DocumentProperties"/>
   </property>
   <property name="toolButtonStyle">
    <enum>Qt::ToolButtonStyle::ToolButtonTextOnly</enum>
@@ -138,6 +135,19 @@
           </property>
           <property name="textFormat">
            <enum>Qt::TextFormat::PlainText</enum>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="fiber_lbl">
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Expanding" vsizetype="Maximum">
+            <horstretch>0</horstretch>
+            <verstretch>0</verstretch>
+           </sizepolicy>
+          </property>
+          <property name="text">
+           <string>Tipo de fibra:</string>
           </property>
          </widget>
         </item>
@@ -295,6 +305,31 @@
           <property name="currentIndex">
            <number>-1</number>
           </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QComboBox" name="fiber_combo">
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Expanding" vsizetype="Maximum">
+            <horstretch>0</horstretch>
+            <verstretch>0</verstretch>
+           </sizepolicy>
+          </property>
+          <item>
+           <property name="text">
+            <string>LPG</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>FBG</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>Interferômetro</string>
+           </property>
+          </item>
          </widget>
         </item>
        </layout>
