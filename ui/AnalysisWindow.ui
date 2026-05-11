@@ -103,7 +103,7 @@
        <bool>true</bool>
       </property>
       <property name="currentIndex">
-       <number>0</number>
+       <number>4</number>
       </property>
       <widget class="QWidget" name="tab_ch1">
        <attribute name="title">
@@ -299,6 +299,9 @@
                      <bold>true</bold>
                     </font>
                    </property>
+                   <property name="cursor">
+                    <cursorShape>PointingHandCursor</cursorShape>
+                   </property>
                    <property name="toolTip">
                     <string>Fixar espectro (1)</string>
                    </property>
@@ -422,6 +425,9 @@
                      <bold>true</bold>
                     </font>
                    </property>
+                   <property name="cursor">
+                    <cursorShape>PointingHandCursor</cursorShape>
+                   </property>
                    <property name="toolTip">
                     <string>Fixar espectro (2)</string>
                    </property>
@@ -538,6 +544,9 @@
                      <pointsize>15</pointsize>
                      <bold>true</bold>
                     </font>
+                   </property>
+                   <property name="cursor">
+                    <cursorShape>PointingHandCursor</cursorShape>
                    </property>
                    <property name="toolTip">
                     <string>Fixar espectro (3)</string>
@@ -656,6 +665,9 @@
                      <bold>true</bold>
                     </font>
                    </property>
+                   <property name="cursor">
+                    <cursorShape>PointingHandCursor</cursorShape>
+                   </property>
                    <property name="toolTip">
                     <string>Fixar espectro (4)</string>
                    </property>
@@ -773,6 +785,9 @@
                      <bold>true</bold>
                     </font>
                    </property>
+                   <property name="cursor">
+                    <cursorShape>PointingHandCursor</cursorShape>
+                   </property>
                    <property name="toolTip">
                     <string>Fixar espectro (5)</string>
                    </property>
@@ -889,6 +904,9 @@
                      <pointsize>15</pointsize>
                      <bold>true</bold>
                     </font>
+                   </property>
+                   <property name="cursor">
+                    <cursorShape>PointingHandCursor</cursorShape>
                    </property>
                    <property name="toolTip">
                     <string>Fixar espectro (6)</string>
@@ -1289,15 +1307,18 @@
               </spacer>
              </item>
              <item>
-              <widget class="QPushButton" name="apodization_btn">
+              <widget class="QPushButton" name="window_btn">
                <property name="sizePolicy">
                 <sizepolicy hsizetype="Maximum" vsizetype="Maximum">
                  <horstretch>0</horstretch>
                  <verstretch>0</verstretch>
                 </sizepolicy>
                </property>
+               <property name="cursor">
+                <cursorShape>ArrowCursor</cursorShape>
+               </property>
                <property name="toolTip">
-                <string>Apodização (A)</string>
+                <string>Janela (J)</string>
                </property>
                <property name="layoutDirection">
                 <enum>Qt::LayoutDirection::LeftToRight</enum>
@@ -1346,6 +1367,9 @@
                  <verstretch>0</verstretch>
                 </sizepolicy>
                </property>
+               <property name="cursor">
+                <cursorShape>ArrowCursor</cursorShape>
+               </property>
                <property name="toolTip">
                 <string>Filtro Savitzky-Golay (S)</string>
                </property>
@@ -1371,6 +1395,9 @@
                  <horstretch>0</horstretch>
                  <verstretch>0</verstretch>
                 </sizepolicy>
+               </property>
+               <property name="cursor">
+                <cursorShape>ArrowCursor</cursorShape>
                </property>
                <property name="toolTip">
                 <string>Média espectral (M)</string>
@@ -1735,6 +1762,9 @@
             <verstretch>0</verstretch>
            </sizepolicy>
           </property>
+          <property name="cursor">
+           <cursorShape>IBeamCursor</cursorShape>
+          </property>
           <property name="minimum">
            <number>100</number>
           </property>
@@ -1786,6 +1816,9 @@
             <horstretch>0</horstretch>
             <verstretch>0</verstretch>
            </sizepolicy>
+          </property>
+          <property name="cursor">
+           <cursorShape>IBeamCursor</cursorShape>
           </property>
           <property name="decimals">
            <number>0</number>
@@ -1854,7 +1887,7 @@
         <item>
          <widget class="QLabel" name="continuous_lbl">
           <property name="text">
-           <string>Salvar continuamente todos os canais</string>
+           <string>Salvar continuamente todos os canais ativos</string>
           </property>
          </widget>
         </item>
@@ -1887,6 +1920,9 @@
           <verstretch>0</verstretch>
          </sizepolicy>
         </property>
+        <property name="cursor">
+         <cursorShape>ArrowCursor</cursorShape>
+        </property>
         <property name="toolTip">
          <string>(Ctrl+S)</string>
         </property>
@@ -1897,6 +1933,9 @@
       </item>
       <item>
        <widget class="QPushButton" name="clear_btn">
+        <property name="cursor">
+         <cursorShape>ArrowCursor</cursorShape>
+        </property>
         <property name="toolTip">
          <string>(Ctrl+L)</string>
         </property>
@@ -1915,6 +1954,9 @@
           <horstretch>0</horstretch>
           <verstretch>0</verstretch>
          </sizepolicy>
+        </property>
+        <property name="cursor">
+         <cursorShape>ArrowCursor</cursorShape>
         </property>
         <property name="toolTip">
          <string>(Enter)</string>

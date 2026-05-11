@@ -25,7 +25,7 @@ class Ui_ConfigWindow(object):
         if not ConfigWindow.objectName():
             ConfigWindow.setObjectName(u"ConfigWindow")
         ConfigWindow.setWindowModality(Qt.WindowModality.NonModal)
-        ConfigWindow.resize(569, 325)
+        ConfigWindow.resize(569, 348)
         sizePolicy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
@@ -208,6 +208,37 @@ class Ui_ConfigWindow(object):
 
         self.verticalLayout.addLayout(self.main_hlay)
 
+        self.horizontalLayout_2 = QHBoxLayout()
+        self.horizontalLayout_2.setObjectName(u"horizontalLayout_2")
+        self.horizontalSpacer_2 = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+
+        self.horizontalLayout_2.addItem(self.horizontalSpacer_2)
+
+        self.startfft_btn = QPushButton(self.centralwidget)
+        self.startfft_btn.setObjectName(u"startfft_btn")
+        self.startfft_btn.setEnabled(False)
+        sizePolicy4 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        sizePolicy4.setHorizontalStretch(0)
+        sizePolicy4.setVerticalStretch(0)
+        sizePolicy4.setHeightForWidth(self.startfft_btn.sizePolicy().hasHeightForWidth())
+        self.startfft_btn.setSizePolicy(sizePolicy4)
+        palette = QPalette()
+        brush = QBrush(QColor(0, 0, 127, 255))
+        brush.setStyle(Qt.BrushStyle.SolidPattern)
+        palette.setBrush(QPalette.ColorGroup.Active, QPalette.ColorRole.Button, brush)
+        palette.setBrush(QPalette.ColorGroup.Active, QPalette.ColorRole.ButtonText, brush)
+        palette.setBrush(QPalette.ColorGroup.Inactive, QPalette.ColorRole.Button, brush)
+        palette.setBrush(QPalette.ColorGroup.Inactive, QPalette.ColorRole.ButtonText, brush)
+        palette.setBrush(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Button, brush)
+        self.startfft_btn.setPalette(palette)
+        self.startfft_btn.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.startfft_btn.setFlat(True)
+
+        self.horizontalLayout_2.addWidget(self.startfft_btn)
+
+
+        self.verticalLayout.addLayout(self.horizontalLayout_2)
+
         self.verticalSpacer_2 = QSpacerItem(20, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
 
         self.verticalLayout.addItem(self.verticalSpacer_2)
@@ -270,11 +301,11 @@ class Ui_ConfigWindow(object):
 
         self.start_btn = QPushButton(self.centralwidget)
         self.start_btn.setObjectName(u"start_btn")
-        sizePolicy4 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        sizePolicy4.setHorizontalStretch(0)
-        sizePolicy4.setVerticalStretch(0)
-        sizePolicy4.setHeightForWidth(self.start_btn.sizePolicy().hasHeightForWidth())
-        self.start_btn.setSizePolicy(sizePolicy4)
+        sizePolicy5 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        sizePolicy5.setHorizontalStretch(0)
+        sizePolicy5.setVerticalStretch(0)
+        sizePolicy5.setHeightForWidth(self.start_btn.sizePolicy().hasHeightForWidth())
+        self.start_btn.setSizePolicy(sizePolicy5)
 
         self.iniciar_hlay.addWidget(self.start_btn)
 
@@ -309,6 +340,7 @@ class Ui_ConfigWindow(object):
         self.fiber_combo.setItemText(1, QCoreApplication.translate("ConfigWindow", u"FBG", None))
         self.fiber_combo.setItemText(2, QCoreApplication.translate("ConfigWindow", u"Interfer\u00f4metro", None))
 
+        self.startfft_btn.setText(QCoreApplication.translate("ConfigWindow", u"An\u00e1lise por FFT", None))
         self.ch_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Canais usados:", None))
         self.ch1_radio.setText(QCoreApplication.translate("ConfigWindow", u"Canal 1", None))
         self.ch2_radio.setText(QCoreApplication.translate("ConfigWindow", u"Canal 2", None))

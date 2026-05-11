@@ -156,7 +156,7 @@ class BraggMeter:
 
         Args:
             string (str): The command to be sent.
-            retries (int): Number of retry attempts. Default is 0.
+            retries (int): Number of retry attempts.
 
         Returns:
             str: The response from the BraggMeter device.
@@ -176,7 +176,7 @@ class BraggMeter:
             resp = resp.decode('latin-1')
         except (socket.error, socket.timeout) as e:
             logger.error(f'Socket error: {e}. Retrying...')
-            if retries > 2:
+            if retries > 2: # 3 attempts total
                 raise ConnectionError(f'Max retries exceeded: {e}')
             return self.send(string, retries=retries+1)
         self.close()
@@ -277,9 +277,10 @@ class BraggMeter:
                 traces = [trace[:len(trace)] for trace in traces]
                 wl = wl[:len(trace)]
 
-        trace = np.array(traces)
+        trace = np.asarray(traces)
 
-        spec = np.stack((wl, trace), axis=1)
+        min_len = min(len(wl), len(trace))
+        spec = np.stack((wl[:min_len], trace[:min_len]), axis=1)
         spec = np.flipud(spec)
         return spec, warn
 
@@ -418,9 +419,17 @@ class Imon512:
         self.open()
         
         try:
-            self.ask('*idn?')
-            response = self.listen()
-            logger.debug(response.decode())
+            for _ in range(1): # 2 attempts
+                self.ask('*idn?')
+                response = self.listen()
+                response = response.decode(errors='ignore').strip()
+                logger.debug(response)
+                if response == 'JETI_VersaPIC_RU60':
+                    time.sleep(0.1)
+                    break
+                time.sleep(0.1)
+            else:
+                raise ConnectionError(f'Unexpected device response after opening port: {response}')
         except Exception as e:
             logger.error(f'Communication error after opening port: {e}')
             raise e
@@ -431,6 +440,7 @@ class Imon512:
         self.tem_param = self.update_temperature_coefficients()
         self.wl = np.arange(0, 510, dtype=float)
         self.temp = None
+        self.set_format(5) # Little endian binary output
 
     def close(self):
         """
@@ -459,7 +469,6 @@ class Imon512:
         """
         Opens the serial port connection with retry logic.
         """
-        last_error = None
         for attempt in range(3):
             try:
                 # Fecha conexão existente antes de abrir uma nova
@@ -495,6 +504,13 @@ class Imon512:
         self.serial_port.reset_input_buffer()
         response = self.serial_port.readline()
         return response
+
+    def set_format(self, format: int):
+        """
+        Sets the output format (0-7)
+        
+        """
+        self.ask('*para:form 5')
 
     def get_temperature(self):
         """
@@ -634,53 +650,69 @@ class Imon512:
         except Exception as e:
             logger.error(f'Failed to compensate for temperature: {e}')        
 
-    def measure(self, n_mean=1, return_spectrum=True):
+    def measure(self, n_mean=1, return_single=True):
         """
         Measure the spectrum.
         
         Args:
             n_mean (int): The number of measurements to be averaged.
-            return_spectrum (bool): If True, returns the spectrum data.
+            return_single (bool): If True, returns the mean of the measurements, otherwise returns all measurements.
         
         Returns:
-            numpy.ndarray: The spectrum data.
+            numpy.ndarray: The measured data.
             bool: Pixel count exceed the saturation threshold.
         """
+        n_pix = 510
+        bytes_per_spec = 2 * n_pix
         
         measurements = []
         warn = False
         self.wl = self.fit_wavelength(510)
         self.ask('*meas:fstmeas')
-        for i in range(0, n_mean):
-            try:
-                # Verifica se a porta e seus objetos internos estão válidos
-                if (self.serial_port is not None and hasattr(self.serial_port, 'is_open')):
-                    serialString = self.serial_port.read(size=2*510)
-                else:
-                    logger.error('Serial port or internal objects became invalid during measurement')
-                    self.open()
-                    serialString = self.serial_port.read(size=2*510)
-            except (AttributeError, OSError, TypeError) as e:
-                logger.error(f'Read error in measurement {i}: {e}. Reopening port...')
-                self.open()
-                serialString = self.serial_port.read(size=2*510)
-            values, current_warn = self.bytes2adc(serialString, n=510)
-            warn = warn or current_warn
-            measurements.append(values[1::])
+        spec_count = 0
+        leftover = b''
+        while spec_count < n_mean:
+            # Verifica se a porta e seus objetos internos estão válidos
+            if (self.serial_port is not None and hasattr(self.serial_port, 'is_open')):
+                in_waiting = self.serial_port.in_waiting
+                if in_waiting > 0: # Se houver dados disponíveis
+                    try:
+                        new_data = self.serial_port.read(size=in_waiting) # Lê tudo que tiver disponível
+                        chunk = leftover + new_data
+                        parts = chunk.split(b'\x00\x00') # Procura o marcador de sincronismo (Pixel 1)
+                        # O primeiro elemento de parts é lixo antes do primeiro Sync
+                        # Os elementos intermediários que têm o tamanho correto são espectros
+                        for i in range(len(parts) - 1):
+                            spec = parts[i]
+                            if len(spec) == (bytes_per_spec - 2): # -2 porque o split removeu o 0x0000
+                                # Reconstroi o dado (adicionando o zero de volta se necessário)
+                                spec = np.frombuffer(b'\x00\x00' + spec, dtype='<u2') # '<u2' para little-endian
+                                warn = warn or bool(np.max(spec) > 48800)
+                                measurements.append(spec[1:])
+                                spec_count += 1
+
+                        # Guarda o que sobrou para a próxima leitura
+                        leftover = b'\x00\x00' + parts[-1] if chunk.endswith(parts[-1]) else b""
+
+                        # Proteção para não estourar a memória se algo der muito errado
+                        if len(leftover) > bytes_per_spec * 2:
+                            leftover = b""
+                            logging.warning('Leftover buffer exceeded expected size, clearing to prevent memory issues.')
+                    except (AttributeError, OSError, TypeError) as e:
+                        raise ValueError(f'Read error in measurement: {e}.')
+            else:
+                logger.error('Serial port or internal objects became invalid during measurement')
         self.ask('esc')
         measurements = np.array(measurements, dtype=float)
-        if n_mean > 1:
-            measurements = np.mean(measurements, axis=0)
-        else:
-            measurements = measurements[0]
         
-        if return_spectrum:
-            spectrum = np.stack((self.wl[1::], measurements), axis=1)
+        if return_single:
+            spectrum = np.stack((self.wl[1::], np.mean(measurements, axis=0)), axis=1)
             return np.flipud(spectrum), warn
         else:
-            return measurements
+            spectrum = np.stack(([self.wl[1::]]*len(measurements), measurements), axis=1)
+            return np.flipud(spectrum), warn
     
-    def get_osa_trace(self, n_mean: int=1, *args):
+    def get_osa_trace(self, n_mean: int=1, return_single: bool=True, *args):
         """
         Retrieves the OSA trace data.
         
@@ -688,29 +720,21 @@ class Imon512:
             numpy.ndarray: The OSA trace data.
             str: An warning message if the spectrum is saturated, otherwise None.
         """
-        spec, warn = self.measure(n_mean=n_mean, return_spectrum=True)
+        spec, warn = self.measure(n_mean=n_mean, return_single=return_single)
         warn = None if not warn else "Pixel count exceed the saturation threshold."
         return spec, warn
-
-    @staticmethod
-    def bytes2adc(streamed_bytes, n=512):
+    
+    def get_multiple_osa_traces(self, n_mean: int=1):
         """
-        Convert bytes to ADC values.
-        
-        Args:
-            streamed_bytes (bytes): The streamed bytes.
-            n (int): The number of ADC values.
+        Retrieves multiple OSA trace data.
         
         Returns:
-            list: The ADC values.
-            bool: Pixel count exceed the saturation threshold.
+            numpy.ndarray: The OSA trace data.
+            str: An warning message if the spectrum is saturated, otherwise None.
         """
-        values = []
-        for i in range(0, 2*n, 2):
-            v = int.from_bytes(streamed_bytes[i:i + 2], byteorder='little')
-            values.append(v)
-        warn = np.max(values) > 48800
-        return values, warn
+        spec, warn = self.measure(n_mean=n_mean, return_single=False)
+        warn = None if not warn else "Pixel count exceed the saturation threshold."
+        return spec, warn
 
     def set_exposure_time(self, et: int):
         """
@@ -821,11 +845,19 @@ class ThorLabs:
     """
     Class to access pyOSA and interact with Thorlabs OSA 20X.
     
+    O fluxo para OSA203 é exclusivamente contínuo.
     """
 
     def __init__(self, osa):
         self.device = osa
         self.warming_error = False
+        self._continuous_iterator = None
+        self._continuous_active = False
+        self._current_channel_info = {
+            'channel': None,
+            'sequence': 0,
+            'switch_time': None,
+        }
         try:
             self.device.setup(autogain=False)
         except Exception as e:
@@ -835,66 +867,190 @@ class ThorLabs:
         """
         Cleans up the device instance.
         """
-        self.osa = None
+        if self._continuous_active:
+            self.device.stop = True
+            self._continuous_active = False
+            self._continuous_iterator = None
+        self.device = None
+
+    def start_continuous_acquisition(self, spectrum_averaging: int = 1):
+        """
+        Inicia aquisição contínua mantendo fluxo sem interrupções.
+        
+        Args:
+            spectrum_averaging (int): Número de espectros para média.
+        """
+        if self._continuous_active:
+            return
+        
+        try:
+            # Small delay to ensure FTSLib is completely idle before restarting
+            import time
+            time.sleep(0.1)
+            
+            self._continuous_iterator = self.device.acquire_continuous(
+                spectrum=True,
+                interferogram=False,
+                spectrum_averaging=spectrum_averaging,
+                apodization="None",
+                y_unit="dBm",
+                ignore_errors=["Reference Warmup"]
+            )
+            self._continuous_active = True
+            logger.debug("Aquisição contínua iniciada para OSA203")
+        except Exception as e:
+            logger.error(f"Erro ao iniciar aquisição contínua: {e}")
+            raise RuntimeError(f"Failed to start continuous acquisition: {e}")
+
+    def stop_continuous_acquisition(self):
+        """
+        Para a aquisição contínua COMPLETAMENTE e finaliza o FTSLib.
+        
+        Isso consome a iteração final do acquire_continuous() para garantir
+        que __stop_continuous_acq() seja chamado e a aquisição FTSLib termine.
+        """
+        if self._continuous_active:
+            if self._continuous_iterator is not None:
+                # Signal the iterator to stop
+                self.device.stop = True
+                
+                # Give callbacks a moment to check the stop flag
+                import time
+                time.sleep(0.05)
+                
+                # Drain any queued data from callbacks that fired before stop
+                if hasattr(self.device, '_drain_queues'):
+                    try:
+                        self.device._drain_queues()
+                    except Exception as e:
+                        logger.debug(f"Error draining queues: {e}")
+                
+                # Consume the final iteration to allow __stop_continuous_acq() to be called
+                try:
+                    next(self._continuous_iterator)
+                except StopIteration:
+                    # Expected - the iterator is exhausted after stop=True
+                    logger.debug("Iterator properly exhausted after stop signal")
+                except Exception as e:
+                    logger.warning(f"Exception consuming final iterator (may still have stopped FTSLib): {e}")
+            
+            self._continuous_active = False
+            self._continuous_iterator = None
+            logger.debug("Aquisição contínua parada completamente para OSA203")
+
+    def flush_continuous_readout(self):
+        """
+        Remove espectros pendentes da fila interna do pyOSA sem parar a aquisição.
+        """
+        if self.device is None:
+            return
+        if hasattr(self.device, '_drain_queues'):
+            self.device._drain_queues()
+            logger.debug("Fila de leitura contínua drenada para OSA203")
+
+    def set_channel_info(self, channel: int):
+        """
+        Registra mudança de canal para sincronizar com espectros contínuos.
+        
+        Args:
+            channel (int): Número do canal que será ativo.
+        """
+        self._current_channel_info['channel'] = channel
+        self._current_channel_info['sequence'] += 1
+        self._current_channel_info['switch_time'] = time.time()
+        logger.debug(f"Canal {channel} registrado para sincronização (seq: {self._current_channel_info['sequence']})")
+
+    def _get_continuous_spectrum(self):
+        """
+        Retorna o próximo espectro do iterador contínuo.
+        
+        Returns:
+            tuple: (wavelengths, intensities, warn_message)
+        """
+        if not self._continuous_active or self._continuous_iterator is None:
+            raise RuntimeError("Aquisição contínua não está ativa")
+        
+        try:
+            # Get next spectrum from continuous acquisition
+            resp = next(self._continuous_iterator)
+            spectrum_data = None
+            if isinstance(resp, dict):
+                spectrum_data = resp.get("spectrum")
+                if spectrum_data is None:
+                    spectrum_data = resp.get(("spectrum", "Detector 1"))
+            else:
+                try:
+                    spectrum_data = resp["spectrum"]
+                except Exception:
+                    for key in resp.keys():
+                        if isinstance(key, tuple) and key and key[0] == "spectrum":
+                            spectrum_data = resp[key]
+                            break
+            
+            if spectrum_data is None:
+                raise RuntimeError("No spectrum data in continuous acquisition")
+            
+            spectrum = spectrum_data
+            wl = np.asarray(spectrum.get_x(), dtype=float)
+            intensities = np.asarray(spectrum.get_y(), dtype=float)
+            
+            if not intensities.any() or wl is None:
+                raise RuntimeError("No valid spectrum acquired.")
+            
+            # Check spectrum validity
+            validity = spectrum.check_validity()
+            warn_messages = []
+            if not validity["ref_laser_locked"]:
+                warn_messages.append("Reference laser not locked")
+            if not validity["interferogram_within_detector_range"]:
+                warn_messages.append("Interferogram is clipped")
+            if not validity["interferogram_is_linear"]:
+                warn_messages.append("Interferogram is non-linear")
+            if not validity["autogain_satisfied"]:
+                warn_messages.append("Autogain was not finished adjusting")
+            
+            warn = ", ".join(warn_messages) if warn_messages else None
+            
+            return wl, intensities, warn
+        except StopIteration:
+            # Iterator stopped - likely due to pause() consuming final iteration
+            logger.debug("Continuous acquisition iterator exhausted (normal during pause)")
+            return None, None, None
+        except Exception as e:
+            logger.error(f"Erro ao obter espectro contínuo: {e}")
+            raise RuntimeError(f"Failed to get continuous spectrum: {e}")
 
     def get_osa_trace(self, n_mean: int=1, *args):
         """
         Retrieves the OSA trace data from the Thorlabs OSA 20X.
 
+        Retorna o próximo espectro da aquisição contínua.
+
         Returns:
-            numpy.ndarray: The OSA trace data.
+            numpy.ndarray: The OSA trace data (wl, intensity pairs).
             str: An warning message if the spectrum has validity issues, otherwise None.
         """
         if self.device is None:
             raise RuntimeError("Device not connected.")
 
         try:
-            wl = None
-            all_intensities = []
-            warn_flags = {
-                "ref_laser_locked": False,
-                "interferogram_within_detector_range": False,
-                "interferogram_is_linear": False,
-                "autogain_satisfied": False,
-            }
+            # If continuous acquisition is not active, return None
+            # This can happen if pause() was called while a request_data was in flight
+            if not self._continuous_active:
+                logger.debug("get_osa_trace called but continuous acquisition not active (likely paused)")
+                return None, None
 
-            for resp in self.device.acquire_continuous(number_of_acquisitions=n_mean,
-                                                       apodization='None', y_unit="dBm",
-                                                       ignore_errors=["Reference Warmup"]):
-                spectrum = resp["spectrum"]
-                wl = np.asarray(spectrum.get_x(), dtype=float)
-                all_intensities.append(np.asarray(spectrum.get_y(), dtype=float))
-
-                validity = spectrum.check_validity()
-                warn_flags["ref_laser_locked"] |= not validity["ref_laser_locked"]
-                warn_flags["interferogram_within_detector_range"] |= not validity["interferogram_within_detector_range"]
-                warn_flags["interferogram_is_linear"] |= not validity["interferogram_is_linear"]
-                warn_flags["autogain_satisfied"] |= not validity["autogain_satisfied"]
-
-            if not all_intensities or wl is None:
-                raise RuntimeError("No spectrum acquired.")
-
-            intensities = np.asarray(all_intensities, dtype=float)
-            if n_mean > 1:
-                intensities = np.mean(intensities, axis=0)
-            else:
-                intensities = intensities[0]
-
-            warn_messages = []
-            if warn_flags["ref_laser_locked"]:
-                warn_messages.append("Reference laser not locked")
-            if warn_flags["interferogram_within_detector_range"]:
-                warn_messages.append("Interferogram is clipped")
-            if warn_flags["interferogram_is_linear"]:
-                warn_messages.append("Interferogram is non-linear")
-            if warn_flags["autogain_satisfied"]:
-                warn_messages.append("Autogain was not finished adjusting")
-
-            warn = ", ".join(warn_messages) if warn_messages else None
+            wl, intensities, warn = self._get_continuous_spectrum()
+            
+            # If _get_continuous_spectrum returned None (iterator exhausted), return None
+            if wl is None or intensities is None:
+                return None, None
+                
             spec = np.stack((wl, intensities), axis=1)
             return spec, warn
         except Exception as e:
-            raise RuntimeError(f"Failed to acquire spectrum: {e}")
+            logger.error(f"Failed to acquire spectrum: {e}")
+            return None, None
         
 class SercaloSwitch:
     """

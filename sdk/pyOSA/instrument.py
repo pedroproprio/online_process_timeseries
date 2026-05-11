@@ -84,6 +84,10 @@ class Instrument:
         self._setvalue_detector_offset: typing.Dict[str,int] = defaultdict(lambda: None)
         self._setvalue_attenuation_filter: typing.Dict[str,int] = defaultdict(lambda: None)
 
+        # Indicates if interferogram/spectrum should be returned, used for continuous acquisition callbacks
+        self._interferogram: bool = False
+        self._spectrum: bool = False
+
         if not self.is_OSA200() and not self.is_Redstone():
             logger.info(self.model)
             logger.info(self.inst_series)
@@ -978,6 +982,12 @@ class Instrument:
             with q.mutex:
                 q.queue.clear()
 
+    def _drain_queues(self):
+        """Remove pending readout items without touching the FTS callbacks."""
+        for q in [self._interferogram_queue, self._spectrum_queue]:
+            with q.mutex:
+                q.queue.clear()
+
 
     def _await_setvalues(self, timeout=5):
         """
@@ -1117,6 +1127,11 @@ class Instrument:
         
         This is called when there is data available to read.
         """
+        # Early exit if acquisition is stopped
+        if self.stop:
+            logger.debug(f"Callback received but stop flag is True, ignoring (event_code={event_code})")
+            return 0
+        
         if spectrometer_index != self.spectrometer_index:
             logger.error("Got Callback from different spectrometer")
             return 0
@@ -1129,9 +1144,11 @@ class Instrument:
                      f"type_of_status:({type_of_status})")
 
         if event_code == 1:
-            self.___callback_interferogram(channel_index)
+            if self._interferogram:
+                self.___callback_interferogram(channel_index)
         elif event_code == 2:
-            self.___callback_spectrum(channel_index)
+            if self._spectrum:
+                self.___callback_spectrum(channel_index)
         elif event_code == 3:
             pass
         elif event_code == 4:
@@ -1286,6 +1303,9 @@ class Instrument:
 
         To stop the acquistion set osa.stop = True in your code
         """
+        self._interferogram = interferogram
+        self._spectrum = spectrum
+        
         self._set_spectrum_averaging(spectrum_averaging)
         self.set_zerofill(zerofill)
         self.set_apodization(apodization)
@@ -1306,6 +1326,7 @@ class Instrument:
             self._check_spectrometer(self.spectrometer_index,
                                          ignore_errors=ignore_errors)
 
+        self._clear_data()
         self.__start_continous_acq()
         # Flag to make sure that we shut down cleanly
         self._continuous_acq_running = True
@@ -1371,6 +1392,9 @@ class Instrument:
         while not self.stop:
             logger.debug(f"Starting acq loop number: {acq_iter}")
             latestdata = self.__inner_acquisition_loop(spectrum, interferogram, avg, **kwargs)
+            if latestdata is None:
+                logger.debug("Continuous acquisition loop interrupted before data was ready")
+                break
             acq_iter += 1
             if number_of_acquisitions != -1:
                 if acq_iter >= number_of_acquisitions:
@@ -1379,20 +1403,21 @@ class Instrument:
 
     def __inner_acquisition_loop(self, spectrum, interferogram, avg, **kwargs):
         latestdata = TupleDict(defaultkey=self._default_detector)
-        # Get interferogram data
-        nr_of_interferograms = avg*len(self._interferogram_detectors)
-        self._wait_for_interferograms(nr_of_interferograms)
 
-        nr_of_spectra = 1*len(self._spectrum_detectors)
-        self._wait_for_spectra(nr_of_spectra)
-
-        interferograms = self._get_last_interferograms(nr_of_interferograms)
         if interferogram:
+            # Get interferogram data
+            nr_of_interferograms = avg*len(self._interferogram_detectors)
+            if not self._wait_for_interferograms(nr_of_interferograms):
+                return None
+            interferograms = self._get_last_interferograms(nr_of_interferograms)
             for key,value in interferograms.items():
                 latestdata["interferogram",key] = value
-        # Get spectrum data
-        specs = self._get_last_spectra(nr_of_spectra)
         if spectrum:
+            nr_of_spectra = 1*len(self._spectrum_detectors)
+            if not self._wait_for_spectra(nr_of_spectra):
+                return None
+            # Get spectrum data
+            specs = self._get_last_spectra(nr_of_spectra)
             for key,value in specs.items():
                 latestdata["spectrum",key] = value
         return latestdata
@@ -1402,17 +1427,17 @@ class Instrument:
         """
         Helper function that waits until the interferograms are ready
         """
-        self.__wait_for_queue(self._interferogram_queue,
-                              "Waiting for interferogram to become available...",
-                              nr)
+        return self.__wait_for_queue(self._interferogram_queue,
+                                     "Waiting for interferogram to become available...",
+                                     nr)
 
     def _wait_for_spectra(self, nr):
         """
         Helper function that waits until the spectra are ready
         """
-        self.__wait_for_queue(self._spectrum_queue,
-                              "Waiting for spectrum to become available...",
-                              nr)
+        return self.__wait_for_queue(self._spectrum_queue,
+                                     "Waiting for spectrum to become available...",
+                                     nr)
 
     def __wait_for_queue(self, q, msg, nr):
         """
@@ -1423,7 +1448,11 @@ class Instrument:
         if q.qsize() > nr:
             logger.warning("Readout queue is filling faster than it is read. "
                           f"Queue size: {q.qsize()}")
+            self._drain_queues()
         while q.qsize() < nr:
+            if self.stop:
+                logger.debug(f"Stopping wait for queue ({msg}) because acquisition was paused/stopped")
+                return False
             time.sleep(0.01)
             if time.time() - lastmsg > 1:
                 lastmsg = time.time()
@@ -1433,6 +1462,8 @@ class Instrument:
 
             if time.time()-starttime > 60*5 * nr: # 5 minutes per item
                 raise TimeoutError("Timeout waiting for data")
+
+        return True
 
     def _set_cycle_counting(self, poll_wave: bool):
         """Enables or disables cycle counting for each channel, needed for reading wavelength."""

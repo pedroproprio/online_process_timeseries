@@ -41,10 +41,17 @@ class DataAcquisition(QObject):
         self.port = port
         self.osa = osa
         self.switch_ports = switch_ports if switch_ports else []
+        
+        # Flags para modo contínuo (OSA203 com múltiplos canais)
+        self._continuous_mode = False
+        self._spectrum_averaging = 1
 
     def run(self):
         """
         Inicia a aquisição de dados com base na interface selecionada.
+        
+        Para OSA203 com múltiplos canais, inicia modo contínuo para evitar
+        pausas entre aquisições de canais diferentes.
 
         """
         self._stopping = False
@@ -65,6 +72,7 @@ class DataAcquisition(QObject):
                     self.device = ThorLabsCCT(cct=self.osa)
                 case 'THORLABS OSA203':
                     self.device = ThorLabs(osa=self.osa)
+                    self._continuous_mode = True
                 case _:
                     logger.error(f"Interface desconhecida: {self.inter}")
                     self.error_occurred.emit("Erro", f"Interface desconhecida: {self.inter}")
@@ -72,6 +80,10 @@ class DataAcquisition(QObject):
                     return
             if self.switch_ports:
                 self.switch = MultiSercaloSwitch(self.switch_ports)
+
+            if self._continuous_mode and hasattr(self.device, 'start_continuous_acquisition'):
+                self.device.start_continuous_acquisition(spectrum_averaging=self._spectrum_averaging)
+                logger.info("Modo de aquisição contínua ativado para OSA203")
         except PermissionError as e:
             logger.error(f"Permissão negada ao abrir porta {self.port}. {e}")
             self.error_occurred.emit("Erro", f"Permissão negada ao abrir porta {self.port}. Certifique-se que a porta não está em uso.")
@@ -102,6 +114,8 @@ class DataAcquisition(QObject):
 
         try:
             logger.info(f"Fechando conexão com {self.inter}.")
+            if device is not None and hasattr(device, 'stop_continuous_acquisition'):
+                device.stop_continuous_acquisition()
             if switch is not None:
                 switch.close()
             if device is not None:
@@ -141,32 +155,65 @@ class DataAcquisition(QObject):
             return
 
         try:
+            if self.inter == 'IBSEN IMON-512' and hasattr(device, 'get_multiple_osa_traces'):
+                spectrum, warn = device.get_multiple_osa_traces(max(1, int(n_mean)))
+                if spectrum is not None and not self._stopping:
+                    self.data_acquired.emit(spectrum, warn, 0)
+                return
+
             if switch is not None:
-                # Define o canal em todos os switches simultaneamente
-                switch.set_channel(channel)
+                # Em modo contínuo (OSA203), apenas sincroniza sem pausas
+                if self._continuous_mode:
+                    # Notifica dispositivo sobre mudança de canal para sincronização
+                    if hasattr(device, 'set_channel_info'):
+                        device.set_channel_info(channel)
 
-                # Dá tempo para o switch estabilizar antes da leitura de confirmação.
-                time.sleep(0.05)
+                    # Em modo contínuo, ainda validamos que os dois switches
+                    # chegaram ao mesmo canal antes de consumir o espectro.
+                    max_retries = 3
+                    for _ in range(max_retries):
+                        switch.set_channel(channel)
+                        try:
+                            current_channel = switch.get_channel()
+                        except Exception:
+                            current_channel = -1
 
-                # Valida que todos os switches foram alterados corretamente
-                max_retries = 3
-                cur_channel = -1
-                for i in range(max_retries):
-                    if switch is not None:
-                        cur_channel = switch.get_channel()
-                        if cur_channel == channel:
-                            break                        
-                        else:
-                            switch.set_channel(channel)
+                        if current_channel == channel:
+                            break
+
+                    if current_channel != channel:
+                        raise Exception(
+                            f"Falha ao sincronizar canal {channel} em todos os switches Sercalo."
+                        )
+
+                    if hasattr(device, 'flush_continuous_readout'):
+                        device.flush_continuous_readout()
+                else:
+                    # Modo padrão (não contínuo): aguarda switch estar stável
+                    switch.set_channel(channel)
+                    time.sleep(0.05)
+                    # Valida que todos os switches foram alterados corretamente
+                    max_retries = 3
+                    cur_channel = -1
+                    for i in range(max_retries):
+                        if switch is not None:
+                            cur_channel = switch.get_channel()
+                            if cur_channel == channel:
+                                break                        
+                            else:
+                                switch.set_channel(channel)
                 
-                if cur_channel != channel and switch is not None:
-                    raise Exception(f"Falha ao configurar canal {channel} em todos os switches Sercalo.")
-                    
+                    if cur_channel != channel and switch is not None:
+                        raise Exception(f"Falha ao configurar canal {channel} em todos os switches Sercalo.")
+                
             spectrum, warn = device.get_osa_trace(n_mean, int(channel))
             if spectrum is not None and not self._stopping:
                 self.data_acquired.emit(spectrum, warn, int(channel))
-            else:
-                logger.warning("Falha ao ler espectro ou espectro vazio.")
+            elif spectrum is None and self._paused:
+                # Silent return if paused - this is expected behavior during pause
+                return
+            elif spectrum is None:
+                logger.debug("Espectro vazio retornado (pode estar pausado ou desconectado).")
         except SerialException as e:
             if self._stopping:
                 return
@@ -182,12 +229,34 @@ class DataAcquisition(QObject):
             self.stop()
             return
 
+    def get_fast_traces(self):
+        """
+        Retorna os traces rápidos do IMON para análise da FFT.
+
+        """
+        device = self.device
+        if device is None:
+            return None
+
+        if self.inter == 'IBSEN IMON-512' and hasattr(device, 'get_multiple_osa_traces'):
+            return device.get_multiple_osa_traces(max(1, self._spectrum_averaging))[0]
+
+        if hasattr(device, 'get_fast_traces'):
+            return device.get_fast_traces()
+
+        return None
+
     def pause(self):
         """
         Pausa temporariamente a aquisição sem fechar o dispositivo.
 
         """
         self._paused = True
+        if self._continuous_mode and self.device is not None and hasattr(self.device, 'stop_continuous_acquisition'):
+            try:
+                self.device.stop_continuous_acquisition()
+            except Exception as e:
+                logger.warning(f"Falha ao pausar aquisição contínua: {e}")
 
     def resume(self):
         """
@@ -195,6 +264,12 @@ class DataAcquisition(QObject):
 
         """
         if not self._stopping:
+            if self._continuous_mode and self.device is not None and hasattr(self.device, 'start_continuous_acquisition'):
+                try:
+                    self.device.start_continuous_acquisition(spectrum_averaging=self._spectrum_averaging)
+                except Exception as e:
+                    logger.error(f"Falha ao retomar aquisição contínua: {e}")
+                    raise
             self._paused = False
 
     def set_exposure_time(self, et: float):
@@ -219,3 +294,21 @@ class DataAcquisition(QObject):
             logger.info(f"Tempo de exposição atual: {et}.")
             return et
         return 0
+
+    def set_spectrum_averaging(self, n_mean: int):
+        """
+        Configura o número de espectros para média espectral.
+
+        Args:
+            n_mean (int): Número de espectros para média.
+        """
+        self._spectrum_averaging = max(1, int(n_mean))
+
+        # Se em modo contínuo, reinicia com novo averaging
+        if self._continuous_mode and hasattr(self, 'device') and self.device is not None:
+            try:
+                self.device.stop_continuous_acquisition()
+                self.device.start_continuous_acquisition(spectrum_averaging=self._spectrum_averaging)
+                logger.info(f"Spectrum averaging alterado para {self._spectrum_averaging} em modo contínuo")
+            except Exception as e:
+                logger.error(f"Erro ao alterar spectrum averaging: {e}")

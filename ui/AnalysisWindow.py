@@ -16,6 +16,7 @@ import pyqtgraph as pg
 from sys import argv
 import numpy as np
 import webbrowser
+import time
 import os
 
 import qdarktheme
@@ -91,7 +92,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.flush_batch_size: int = 25
         # Intervalo para flush automático no modo contínuo (ms)
         self.flush_interval_ms: int = 15000
-        # Limite de inflec mantidos em memória para evitar lentidão da UI
+        # Limite de pontos mantidos em memória para evitar lentidão da UI
         self.max_live_points: int = 5000
         # Unidade do eixo x (comprimento de onda)
         self.xUnit: str = 'nm'
@@ -113,6 +114,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.active_traces = []
         # Botão de aviso (criado dinamicamente em _show_warning)
         self.warning_btn: QPushButton | None = None
+        # Mapa mensagem -> índice do canal que exibiu o popup
+        self._warning_popup_shown: dict[str, int] = {}
         # Flag para indicar se a aquisiçao está ativa
         self._running: bool = False
         # Caminho para o arquivo de dados selecionado pelo usuário
@@ -125,9 +128,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # Lista dos canais habilitados para aquisição cíclica
         self.enabled_channels: list[int] = []
 
-        # Método de apodização aplicado no plot (None desabilita)
-        self.apodization: str | None = None
-        self.apodization_methods = {
+        # Método de janela aplicado no plot (None desabilita)
+        self.window: str | None = None
+        self.window_methods = {
             'Tukey': lambda m, *a: windows.tukey(m, sym=False),
             'Triangular': lambda m, *a: windows.triang(m, sym=False),
             'Taylor': lambda m, *a: windows.taylor(m, sym=False),
@@ -157,6 +160,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.worker: DataAcquisition | None = None
         #Timer para solicitar dados periodicamente
         self.timer: QTimer | None = None
+        self._cycle_started_at: float | None = None
+        self._cycle_pending_responses: int = 0
         # Flag para evitar chamadas concorrentes de _cleanup_thread
         self._is_stopping = False
         
@@ -208,7 +213,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.stop_btn.clicked.connect(self.toggle_thread) # Inicia/Para a aquisição de dados
         self.save_btn.clicked.connect(self.save_data) # Salva os dados processados
         self.clear_btn.clicked.connect(self.clear_plot) # Limpa os gráficos
-        self.apodization_btn.clicked.connect(self.select_apodization_method)
+        self.window_btn.clicked.connect(self.select_window_method)
         self.savgol_btn.clicked.connect(self.select_savgol_parameters)
         self.mean_btn.clicked.connect(self.select_mean_samples)
         self.actionPeaks.triggered.connect(self.select_peak_parameters)
@@ -236,12 +241,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.continuous_chk = ToggleSwitch(self.continuous_hlay)
 
         # Ícones dos botões
-        cur_dir = os.path.dirname(os.path.abspath(argv[0]))
-        apo = os.path.join(cur_dir, "img", "apodization.png")
-        self.apodization_btn.setIcon(QIcon(apo))
-        svg = os.path.join(cur_dir, "img", "savgol.png")
+        main_dir = os.path.dirname(os.path.abspath(argv[0]))
+        apo = os.path.join(main_dir, "img", "apodization.png")
+        self.window_btn.setIcon(QIcon(apo))
+        svg = os.path.join(main_dir, "img", "savgol.png")
         self.savgol_btn.setIcon(QIcon(svg))
-        mean = os.path.join(cur_dir, "img", "mean.png")
+        mean = os.path.join(main_dir, "img", "mean.png")
         self.mean_btn.setIcon(QIcon(mean))
 
         # Conecta atalhos do teclado
@@ -251,7 +256,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.stop_btn.setShortcut('Return')
         self.clear_btn.setShortcut('Ctrl+L')
         self.save_btn.setShortcut('Ctrl+S')
-        self.apodization_btn.setShortcut('A')
+        self.window_btn.setShortcut('J')
         self.savgol_btn.setShortcut('S')
         self.mean_btn.setShortcut('M')
         for i, button in enumerate(self._list_fix_buttons()):
@@ -262,52 +267,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
     def _load_persistent_settings(self):
         """
-        Carrega preferências persistidas da janela de análise.
+        Carrega preferências persistidas globais da janela de análise.
+        As configurações específicas de fibra (window, savgol, mean, peaks) são
+        carregadas separadamente em _load_fiber_specific_settings().
 
         """
-        saved_sample_rate = self.settings.value('analysis/sample_rate', self.sr_spin.value(), type=int)
-        self.sr_spin.setValue(max(1, int(saved_sample_rate)))
-        self.sample_rate = int(self.sr_spin.value())
-
-        saved_window = self.settings.value('analysis/savgol_window_points', self.savgol_window_points, type=int)
-        saved_poly = self.settings.value('analysis/savgol_polyorder', self.savgol_polyorder, type=int)
-        window_points = max(0, int(saved_window))
-        if window_points % 2 == 0 and window_points > 0:
-            window_points -= 1
-        polyorder = max(1, int(saved_poly))
-        if window_points > 0 and polyorder >= window_points:
-            polyorder = max(1, window_points - 1)
-        self.savgol_window_points = window_points
-        self.savgol_polyorder = polyorder
-
-        saved_apodization = self.settings.value('analysis/apodization', 'None', type=str)
-        if saved_apodization in self.apodization_methods:
-            self.apodization = saved_apodization
-        else:
-            self.apodization = None
-
-        saved_mean = self.settings.value('analysis/mean_samples', self.mean_samples, type=int)
-        self.mean_samples = max(1, min(1000, int(saved_mean)))
-
-        saved_prominence = self.settings.value(
-            'analysis/peak_prominence',
-            self.peak_detection_params['prominence'],
-            type=float,
-        )
-        saved_width = self.settings.value(
-            'analysis/peak_width',
-            self.peak_detection_params['width'],
-            type=float,
-        )
-        saved_distance = self.settings.value(
-            'analysis/peak_distance',
-            self.peak_detection_params['distance'],
-            type=int,
-        )
-        self.peak_detection_params['prominence'] = max(0.0, float(saved_prominence))
-        self.peak_detection_params['width'] = max(0.0, float(saved_width))
-        self.peak_detection_params['distance'] = max(1, int(saved_distance))
-
         saved_theme = self.settings.value('analysis/theme', self.theme, type=str)
         self.theme = saved_theme if saved_theme in ('light', 'dark') else 'dark'
 
@@ -322,16 +286,15 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
     def _save_persistent_settings(self):
         """
         Salva preferências persistentes da janela de análise.
+        Configurações específicas de fibra são salvas com prefixo de fibra.
 
         """
-        self.settings.setValue('analysis/sample_rate', int(self.sr_spin.value()))
-        self.settings.setValue('analysis/savgol_window_points', int(self.savgol_window_points))
-        self.settings.setValue('analysis/savgol_polyorder', int(self.savgol_polyorder))
-        self.settings.setValue('analysis/apodization', self.apodization or 'None')
-        self.settings.setValue('analysis/mean_samples', int(self.mean_samples))
-        self.settings.setValue('analysis/peak_prominence', float(self.peak_detection_params['prominence']))
-        self.settings.setValue('analysis/peak_width', float(self.peak_detection_params['width']))
-        self.settings.setValue('analysis/peak_distance', int(self.peak_detection_params['distance']))
+        # Salva configurações específicas de fibra (window, savgol, mean, peaks)
+        self._save_fiber_specific_settings()
+
+        key_sample_rate = self._interface_settings_key('sample_rate')
+        if key_sample_rate:
+            self.settings.setValue(key_sample_rate, int(self.sr_spin.value()))
 
         theme_value = self.theme
         if isinstance(self.config_data, dict):
@@ -344,6 +307,49 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.settings.setValue('analysis/x_unit', x_unit_value)
         self._save_roi_for_current_mode()
         self.settings.sync()
+
+    def _analysis_mode_key(self, key_name: str) -> str | None:
+        """
+        Retorna a chave de settings específica de interface+fibra.
+        Args:
+            key_name (str): Nome da chave base (ex: 'window', 'savgol_window_points').
+        Returns:
+            str | None: Chave com prefixo de interface e fibra, ou None se faltar contexto.
+
+        """
+        if not isinstance(self.config_data, dict):
+            return None
+
+        inter = str(self.config_data.get('inter', '')).strip()
+        fiber = self._fiber_mode().strip()
+        if not inter or not fiber:
+            return None
+
+        inter_key = inter.replace('/', '_').replace(' ', '_')
+        fiber_key = fiber.replace('/', '_').replace(' ', '_')
+        return f'analysis/{inter_key}/{fiber_key}/{key_name}'
+
+    def _interface_settings_key(self, key_name: str) -> str | None:
+        """
+        Retorna a chave de settings específica de interface.
+
+        """
+        if not isinstance(self.config_data, dict):
+            return None
+
+        inter = str(self.config_data.get('inter', '')).strip()
+        if not inter:
+            return None
+
+        inter_key = inter.replace('/', '_').replace(' ', '_')
+        return f'analysis/{inter_key}/{key_name}'
+
+    def _get_default_window(self) -> str | None:
+        """
+        Retorna o valor padrão de window (apodização) baseado no instrumento.
+        """
+        # Todos os instrumentos usam None como padrão (sem apodização)
+        return None
 
     def _roi_settings_key(self) -> str | None:
         """
@@ -361,6 +367,130 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         inter_key = inter.replace('/', '_')
         fiber_key = fiber.replace('/', '_')
         return f'analysis/roi_range/{inter_key}/{fiber_key}'
+
+    def _save_fiber_specific_settings(self):
+        """
+        Salva as configurações específicas de interface+fibra (window, savgol, mean, peaks).
+        Estas configurações variam por tipo de interface e de fibra.
+        
+        """
+        # Window (apodização)
+        key_window = self._analysis_mode_key('window')
+        if key_window:
+            self.settings.setValue(key_window, self.window or 'None')
+        
+        # Savitzky-Golay
+        key_savgol_window = self._analysis_mode_key('savgol_window_points')
+        key_savgol_poly = self._analysis_mode_key('savgol_polyorder')
+        if key_savgol_window:
+            self.settings.setValue(key_savgol_window, int(self.savgol_window_points))
+        if key_savgol_poly:
+            self.settings.setValue(key_savgol_poly, int(self.savgol_polyorder))
+        
+        # Mean samples
+        key_mean = self._analysis_mode_key('mean_samples')
+        if key_mean:
+            self.settings.setValue(key_mean, int(self.mean_samples))
+        
+        # Peak detection params — salva por fibra, com fallback para interface
+        key_prominence = self._analysis_mode_key('peak_prominence') or self._interface_settings_key('peak_prominence')
+        key_width = self._analysis_mode_key('peak_width') or self._interface_settings_key('peak_width')
+        key_distance = self._analysis_mode_key('peak_distance') or self._interface_settings_key('peak_distance')
+        if key_prominence:
+            self.settings.setValue(key_prominence, float(self.peak_detection_params['prominence']))
+        if key_width:
+            self.settings.setValue(key_width, float(self.peak_detection_params['width']))
+        if key_distance:
+            self.settings.setValue(key_distance, int(self.peak_detection_params['distance']))
+
+    def _load_fiber_specific_settings(self):
+        """
+        Carrega as configurações específicas de interface+fibra (window, savgol, mean, peaks).
+        Chamado em load_config() após config_data estar definido.
+        
+        """
+        # Window (apodização)
+        key_window = self._analysis_mode_key('window')
+        if key_window:
+            default_window = self._get_default_window()
+            # Usa 'None' como chave de busca para compatibilidade com QSettings
+            saved_window = self.settings.value(key_window, default_window or 'None', type=str)
+            if saved_window in self.window_methods:
+                self.window = saved_window
+            else:
+                self.window = default_window
+        
+        # Savitzky-Golay
+        key_savgol_window = self._analysis_mode_key('savgol_window_points')
+        key_savgol_poly = self._analysis_mode_key('savgol_polyorder')
+        if key_savgol_window and key_savgol_poly:
+            saved_window = self.settings.value(key_savgol_window, self.savgol_window_points, type=int)
+            saved_poly = self.settings.value(key_savgol_poly, self.savgol_polyorder, type=int)
+            window_points = max(0, int(saved_window))
+            if window_points % 2 == 0 and window_points > 0:
+                window_points -= 1
+            polyorder = max(1, int(saved_poly))
+            if window_points > 0 and polyorder >= window_points:
+                polyorder = max(1, window_points - 1)
+            self.savgol_window_points = window_points
+            self.savgol_polyorder = polyorder
+        
+        # Mean samples
+        # Usa padrão específico do instrumento se não houver valor salvo
+        key_mean = self._analysis_mode_key('mean_samples')
+        if key_mean:
+            if isinstance(self.config_data, dict):
+                inter = str(self.config_data.get('inter', '')).strip()
+                if inter == 'THORLABS OSA203':
+                    self.mean_samples = 1
+            saved_mean = self.settings.value(key_mean, self.mean_samples, type=int)
+            self.mean_samples = int(saved_mean)
+        
+        # Peak detection params (carrega cada chave independentemente)
+        key_prominence = self._analysis_mode_key('peak_prominence') or self._interface_settings_key('peak_prominence')
+        key_width = self._analysis_mode_key('peak_width') or self._interface_settings_key('peak_width')
+        key_distance = self._analysis_mode_key('peak_distance') or self._interface_settings_key('peak_distance')
+        if key_prominence:
+            saved_prominence = self.settings.value(
+                key_prominence,
+                self.peak_detection_params['prominence'],
+                type=float,
+            )
+            try:
+                self.peak_detection_params['prominence'] = max(0.0, float(saved_prominence))
+            except Exception:
+                pass
+        if key_width:
+            saved_width = self.settings.value(
+                key_width,
+                self.peak_detection_params['width'],
+                type=float,
+            )
+            try:
+                self.peak_detection_params['width'] = max(0.0, float(saved_width))
+            except Exception:
+                pass
+        if key_distance:
+            saved_distance = self.settings.value(
+                key_distance,
+                self.peak_detection_params['distance'],
+                type=int,
+            )
+            try:
+                self.peak_detection_params['distance'] = max(1, int(saved_distance))
+            except Exception:
+                pass
+
+    def _load_interface_specific_settings(self):
+        """
+        Carrega as configurações específicas de interface, como sample_rate.
+
+        """
+        key_sample_rate = self._interface_settings_key('sample_rate')
+        if key_sample_rate:
+            saved_sample_rate = self.settings.value(key_sample_rate, self.sr_spin.value(), type=int)
+            self.sr_spin.setValue(int(saved_sample_rate))
+            self.sample_rate = int(self.sr_spin.value())
 
     def _save_roi_for_current_mode(self):
         """
@@ -392,6 +522,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             if default_roi is not None:
                 self.roi_range = default_roi
                 self.roi_region.setRegion(self.roi_range)
+                # Aplica ROI padrão a todos os canais habilitados
+                if hasattr(self, 'enabled_channels') and isinstance(self.enabled_channels, list):
+                    for idx in self.enabled_channels:
+                        state = self.channel_states.setdefault(idx, self._default_channel_state())
+                        state['roi_range'] = list(self.roi_range)
             return
 
         value = self.settings.value(key, '', type=str)
@@ -399,6 +534,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             if default_roi is not None:
                 self.roi_range = default_roi
                 self.roi_region.setRegion(self.roi_range)
+                # Aplica ROI padrão a todos os canais habilitados
+                if hasattr(self, 'enabled_channels') and isinstance(self.enabled_channels, list):
+                    for idx in self.enabled_channels:
+                        state = self.channel_states.setdefault(idx, self._default_channel_state())
+                        state['roi_range'] = list(self.roi_range)
             return
 
         try:
@@ -415,11 +555,21 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             if default_roi is not None:
                 self.roi_range = default_roi
                 self.roi_region.setRegion(self.roi_range)
+                # Aplica ROI padrão a todos os canais habilitados
+                if hasattr(self, 'enabled_channels') and isinstance(self.enabled_channels, list):
+                    for idx in self.enabled_channels:
+                        state = self.channel_states.setdefault(idx, self._default_channel_state())
+                        state['roi_range'] = list(self.roi_range)
             return
 
         m_to_unit = 1.0 / self._unit_to_meter_factor(self.xUnit)
         self.roi_range = [roi_min_m * m_to_unit, roi_max_m * m_to_unit]
         self.roi_region.setRegion(self.roi_range)
+        # Aplica ROI restaurada a todos os canais habilitados
+        if hasattr(self, 'enabled_channels') and isinstance(self.enabled_channels, list):
+            for idx in self.enabled_channels:
+                state = self.channel_states.setdefault(idx, self._default_channel_state())
+                state['roi_range'] = list(self.roi_range)
 
     def _default_roi_for_current_mode(self) -> list[float] | None:
         """
@@ -453,13 +603,27 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         return {'Timestamp': [], 'Intensidade': [], 'Vale': [], 'Picos': []}
 
+    def _fiber_mode(self) -> str:
+        """
+        Returns:
+            str: Modo normalizado da fibra. Retorna 'FBG', 'INT' ou o valor original.
+
+        """
+        fiber = str(self.config_data.get('fiber', '')).strip()
+        fiber_key = fiber.casefold()
+        if fiber_key == 'fbg':
+            return 'FBG'
+        if fiber_key in ('int', 'interferômetro', 'interferometro', 'interferometer'):
+            return 'INT'
+        return fiber
+
     def _result_key(self) -> str:
         """
         Returns:
             str: a chave correta para armazenar os resultados processados, dependendo do tipo de fibra selecionada.
         
         """
-        return 'Picos' if self.config_data.get('fiber') in ('FBG', 'Interferômetro') else 'Vale'
+        return 'Picos' if self._fiber_mode() in ('FBG', 'INT') else 'Vale'
 
     def _flatten_peak_values(self, values) -> list[float]:
         """
@@ -659,7 +823,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 expanded.append((sample_name, sample_data))
         return expanded
 
-    def _get_fbg_peak_color(self, wavelength: float) -> tuple:
+    def _get_fbg_peak_color(self, wavelength: float, used_keys_in_spectrum: set | None = None) -> tuple:
         """
         Obtém ou atribui uma cor consistente para um pico FBG baseado em seu wavelength.
         Args:
@@ -670,16 +834,22 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         # Procura por um pico existente próximo a este wavelength
         matching_wl = self._find_matching_peak_key(self.fbg_peak_color_map, wavelength)
+
+        # Se encontrou um match e essa chave ainda não foi usada no espectro
         if matching_wl is not None:
-            return self.fbg_peak_color_map[matching_wl]
-        
-        # Se não encontrou, atribui uma nova cor
+            if used_keys_in_spectrum is None or matching_wl not in used_keys_in_spectrum:
+                if used_keys_in_spectrum is not None:
+                    used_keys_in_spectrum.add(matching_wl)
+                return self.fbg_peak_color_map[matching_wl]
+
+        # Caso contrário — ou não encontrou match, ou a chave já foi usada
+        # — cria um novo mapeamento persistente para este wavelength e retorna
         peak_count = len(self.fbg_peak_color_map)
-        # Garante que sempre temos cores suficientes
         max_peaks = max(peak_count + 1, 3)
         new_color = pg.intColor(peak_count, hues=max_peaks)
         self.fbg_peak_color_map[wavelength] = new_color
-        
+        if used_keys_in_spectrum is not None:
+            used_keys_in_spectrum.add(wavelength)
         return new_color
 
     def _clear_fbg_peak_colors(self):
@@ -694,9 +864,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         Aplica as configurações específicas para o tipo de fibra selecionado.
         
         """
-        fiber = self.config_data.get('fiber')
+        fiber = self._fiber_mode()
         is_fbg = fiber == 'FBG'
-        is_peak_mode = fiber in ('FBG', 'Interferômetro')
+        is_peak_mode = fiber in ('FBG', 'INT')
         self.actionPeaks.setEnabled(is_peak_mode)
         w = 'picos' if is_fbg else 'vales'
         self.actionPeaks.setText(f'Encontrar {w}')
@@ -797,10 +967,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 x_vals = np.asarray(trace[0], dtype=float)
                 y_vals = preprocess_plot_data(
                     np.asarray(trace[1], dtype=float),
-                    self.apodization_methods,
+                    self.window_methods,
                     self.savgol_window_points,
                     self.savgol_polyorder,
-                    self.apodization,
+                    self.window,
                 )
 
                 main_name = channel_name if first_trace else None
@@ -973,11 +1143,67 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             return
 
         if self.enabled_channels:
+            self._cycle_started_at = time.monotonic()
+            self._cycle_pending_responses = len(self.enabled_channels)
             for tab_idx in self.enabled_channels:
                 self.request_data_signal.emit(self.mean_samples, tab_idx + 1)
             return
 
+        self._cycle_started_at = time.monotonic()
+        self._cycle_pending_responses = 1
         self.request_data_signal.emit(self.mean_samples, int(self.cfg_spin.value()))
+
+    def _arm_request_timer(self, delay_ms: int | None = None):
+        """
+        Rearma o timer de aquisição como disparo único.
+
+        O próximo ciclo só é agendado depois que a aquisição atual termina,
+        usando o intervalo definido apenas como tempo mínimo entre aquisições.
+
+        """
+        if self.timer is None:
+            self.timer = QTimer(self)
+            self.timer.setSingleShot(True)
+            self.timer.timeout.connect(self._request_cycle_data)
+
+        if delay_ms is None:
+            delay_ms = int(self.sample_rate)
+
+        self.timer.start(delay_ms)
+
+    def _on_cycle_response_received(self):
+        """
+        Conta respostas do ciclo atual e agenda o próximo disparo quando todas
+        as leituras previstas terminarem.
+
+        """
+        if self._cycle_pending_responses <= 0:
+            return
+
+        self._cycle_pending_responses -= 1
+        if self._cycle_pending_responses > 0:
+            return
+
+        if not self._running or self._is_stopping:
+            return
+
+        elapsed_ms = 0
+        if self._cycle_started_at is not None:
+            elapsed_ms = int((time.monotonic() - self._cycle_started_at) * 1000)
+
+        next_delay_ms = max(0, int(self.sample_rate) - elapsed_ms)
+        self._cycle_started_at = None
+        self._arm_request_timer(next_delay_ms)
+
+    def _handle_data_acquired(self, data, warning, channel: int):
+        """
+        Encaminha os dados recebidos e atualiza o agendamento do próximo ciclo.
+
+        """
+        try:
+            self.update_plot(data, warning, channel)
+        finally:
+            self._on_cycle_response_received()
 
     def _on_tab_changed(self, index: int):
         """
@@ -1034,18 +1260,18 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         return np.asarray(values, dtype=float) / self._unit_to_meter_factor(unit)
 
-    def select_apodization_method(self):
+    def select_window_method(self):
         """
-        Abre um diálogo para selecionar o método de apodização a ser aplicado no espectro, ou 'None' para desabilitar a apodização.
+        Abre um diálogo para selecionar o método de janela a ser aplicado no espectro, ou 'None' para desabilitar a janela.
 
         """
-        items = [*self.apodization_methods.keys(), 'None']
-        current_item = self.apodization if self.apodization is not None else 'None'
+        items = [*self.window_methods.keys(), 'None']
+        current_item = self.window if self.window is not None else 'None'
         current_index = items.index(current_item)
 
         selected, accepted = QInputDialog.getItem(
             self,
-            'Apodização',
+            'Janela',
             'Selecione o método:',
             items,
             current_index,
@@ -1054,8 +1280,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         if not accepted:
             return
 
-        self.apodization = None if selected == 'None' else selected
-        logger.info(f"Método de apodização selecionado: {self.apodization or 'None'}")
+        self.window = None if selected == 'None' else selected
+        logger.info(f"Método de janela selecionado: {self.window or 'None'}")
         self._save_persistent_settings()
 
         if self.spectra_data:
@@ -1100,7 +1326,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             window_points = max(0, window_points - 1)  # Garante que seja ímpar e positivo
 
         if polyorder >= window_points and window_points > 0:
-            QMessageBox.warning(self, 'Filtro Savitzky-Golay', 'O grau do polinômio deve ser menor que o número de inflec da janela.')
+            QMessageBox.warning(self, 'Filtro Savitzky-Golay', 'O grau do polinômio deve ser menor que o número de pontos da janela.')
             return
 
         self.savgol_window_points = window_points
@@ -1123,7 +1349,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             'Número de espectros:',
             self.mean_samples,
             1,
-            1000 if self.config_data.get('inter') != 'BRAGGMETER FS22DI HBM' else 1,
+            10000 if self.config_data.get('inter') != 'THORLABS OSA203' else 1,
             1,
         )
         if not accepted:
@@ -1139,11 +1365,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         
         Parâmetros:
         - Prominência: altura mínima do pico em dBm
-        - Largura: largura mínima do pico em inflec (samples)
-        - Distância: distância mínima entre picos em inflec (samples)
+        - Largura: largura mínima do pico em pontos (samples)
+        - Distância: distância mínima entre picos em pontos (samples)
 
         """
-        is_int = self.config_data.get('fiber') == 'Interferômetro'
+        is_int = self._fiber_mode() == 'INT'
         feature_label = 'vales' if is_int else 'picos'
 
         dialog = QDialog(self)
@@ -1156,19 +1382,18 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         prominence_spin.setLocale(QLocale(QLocale.English)) # Separador decimal como ponto
         prominence_spin.setValue(float(self.peak_detection_params['prominence']))
 
-        width_spin = QDoubleSpinBox(dialog)
-        width_spin.setRange(0.0, 100_000)
-        width_spin.setDecimals(3)
+        width_spin = QSpinBox(dialog)
+        width_spin.setRange(0, 100_000)
         width_spin.setLocale(QLocale(QLocale.English)) # Separador decimal como ponto
-        width_spin.setValue(float(self.peak_detection_params['width']))
+        width_spin.setValue(int(self.peak_detection_params['width']))
 
         distance_spin = QSpinBox(dialog)
         distance_spin.setRange(1, 100_000)
         distance_spin.setValue(int(self.peak_detection_params['distance']))
 
         layout.addRow('Prominência (dBm):', prominence_spin)
-        layout.addRow('Largura (inflec):', width_spin)
-        layout.addRow('Distância (inflec):', distance_spin)
+        layout.addRow('Largura (pontos):', width_spin)
+        layout.addRow('Distância (pontos):', distance_spin)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
         layout.addRow(buttons)
@@ -1263,8 +1488,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.spectraPlotWidget.clear()
         self.spectraPlotWidget.addItem(self.roi_region)
 
-        y_values = preprocess_plot_data(y_values, self.apodization_methods, 
-                                        self.savgol_window_points, self.savgol_polyorder, self.apodization)
+        y_values = preprocess_plot_data(y_values, self.window_methods, 
+                                        self.savgol_window_points, self.savgol_polyorder, self.window)
 
         brush = self._visible_spectrum_brush(x_values)
         plot_kwargs = {'pen': pg.mkPen(self.theme_colors['spectrum'], width=1),}
@@ -1280,8 +1505,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     continue
                 color = button.palette().color(QPalette.ColorRole.Button)
                 x = np.asarray(self.fixed_traces[str(button)][0], dtype=float)
-                y = preprocess_plot_data(np.asarray(self.fixed_traces[str(button)][1], dtype=float), self.apodization_methods, 
-                                         self.savgol_window_points, self.savgol_polyorder, self.apodization)
+                y = preprocess_plot_data(np.asarray(self.fixed_traces[str(button)][1], dtype=float), self.window_methods, 
+                                         self.savgol_window_points, self.savgol_polyorder, self.window)
                 self.spectraPlotWidget.plot(x, y, pen=pg.mkPen(color, width=1, style=Qt.PenStyle.DashLine))
 
     def _list_fix_buttons(self) -> list[QPushButton]:
@@ -1297,7 +1522,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             buttons.append(widget)
         return buttons
 
-    def set_theme(self, theme: str):
+    def set_theme(self, theme: str, persist: bool = True):
         """
         Aplica tema claro/escuro para widgets Qt e gráficos pyqtgraph.
         Args:
@@ -1312,7 +1537,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         if theme == self.config_data.get('theme') and self.theme_colors:
             self.actionLight.setChecked(theme == 'light')
             self.actionDark.setChecked(theme == 'dark')
-            self._save_persistent_settings()
+            if persist:
+                self._save_persistent_settings()
             return
 
         self.config_data['theme'] = theme
@@ -1380,7 +1606,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         self._setup_merge_plots()
         self._refresh_merge_views()
-        self._save_persistent_settings()
+        if persist:
+            self._save_persistent_settings()
 
     def open_file(self):
         """
@@ -1428,7 +1655,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.config_data['theme'] = self.theme
  
         # Aplica o tema
-        self.set_theme(self.theme)
+        self.set_theme(self.theme, persist=False)
 
         # Aplica a unidade persistida do eixo X
         self.actionM.setChecked(self.xUnit == 'm')
@@ -1441,8 +1668,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         inter = config.get('inter')
         if inter in ('IBSEN IMON-512', 'BRAGGMETER FS22DI HBM'):
             self.spectraPlotWidget.setLabel('left', 'Potência', units='u.a.')
-        if inter in ('BRAGGMETER FS22DI HBM'):
-            self.mean_samples = 1
 
         channels = config.get('channels')
         merge_index = self.tabWidget.indexOf(getattr(self, 'tab_merge'))
@@ -1457,11 +1682,14 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         }
         self.enabled_channels = self._enabled_tab_indices()
 
+        self._load_interface_specific_settings()
+
         first_enabled = self.enabled_channels[0] if self.enabled_channels else 0
         self.tabWidget.setCurrentIndex(first_enabled)
         self._restore_channel_state(first_enabled)
         self._apply_fiber_mode()
-        if self.config_data.get('fiber') != 'FBG':
+        self._load_fiber_specific_settings()
+        if self._fiber_mode() != 'FBG':
             self._restore_roi_for_current_mode()
         self._refresh_active_channel_view()
         self._refresh_merge_views()
@@ -1548,7 +1776,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         if self.thread is not None:
             return
 
-        self.sample_rate = int(self.sr_spin.value())
+        self.sample_rate = max(0, int(self.sr_spin.value()))
         self._save_persistent_settings()
             
         port = self.config_data.get('port')
@@ -1577,14 +1805,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.thread.started.connect(self._thread_started)
         self.request_data_signal.connect(self.worker.request_data, Qt.QueuedConnection)
         self.stop_worker_signal.connect(self.worker.stop, Qt.QueuedConnection)
-        self.worker.data_acquired.connect(self.update_plot)
+        self.worker.data_acquired.connect(self._handle_data_acquired)
         self.worker.finished.connect(self._cleanup_thread)
         self.worker.error_occurred.connect(self._show_error)
+        time.sleep(.1)
         
         self.thread.start()
-
-        if self.continuous_timer is not None:
-             self.continuous_timer.start(self.sample_duration * 1000)
 
         self._running = True
         self.stop_btn.setText("Parar")
@@ -1609,10 +1835,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self.flush_timer.timeout.connect(self._flush_continuous_buffer)
             self.flush_timer.start(self.flush_interval_ms)
 
-        # Configura o timer para solicitar dados periodicamente
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self._request_cycle_data)
-        self.timer.start(self.sample_rate)
+        # Configura o timer para solicitar dados como disparo único
+        self._arm_request_timer(self.sample_rate)
 
         match self.config_data.get('inter'):
             case 'IBSEN IMON-512':
@@ -1682,22 +1906,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # Reaplica o modo contínuo sem recriar thread/worker para evitar
         # fechamento e reabertura da porta serial no Retomar.
         if self.continuous_chk.isChecked():
-            if self.continuous_timer is None:
-                if not self.continuous_cfg():
-                    QApplication.instance().restoreOverrideCursor()
-                    self.stop_btn.setEnabled(True)
-                    return
-            if self.continuous_timer is not None and self.sample_duration is not None:
-                self.continuous_timer.start(self.sample_duration * 1000)
-        elif self.continuous_timer is not None:
-            if self.continuous_timer.isActive():
-                self.continuous_timer.stop()
-            try:
-                self.continuous_timer.timeout.disconnect()
-            except Exception:
-                pass
-            self.continuous_timer.deleteLater()
-            self.continuous_timer = None
+            if not self.continuous_cfg():
+                QApplication.instance().restoreOverrideCursor()
+                self.stop_btn.setEnabled(True)
+                return
 
         try:
             self.worker.resume()
@@ -1706,10 +1918,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         self.sample_rate = self.sr_spin.value()
 
-        if self.timer is None:
-            self.timer = QTimer(self)
-            self.timer.timeout.connect(self._request_cycle_data)
-        self.timer.start(self.sample_rate)
+        self._arm_request_timer(self.sample_rate)
 
         self._running = True
         self.stop_btn.setText("Parar")
@@ -1737,45 +1946,64 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         except Exception:
             pass
 
-    def _show_warning(self, message: str):
+    def _show_warning(self, message: str, channel: int | None = None):
         """
         Mostra uma caixa de diálogo de aviso de forma não-bloqueante.
         Args:
             message (str): Mensagem de aviso a ser exibida.
         
         """
+        # Determina o índice do canal para este aviso (usa o canal ativo se não fornecido)
+        target_idx = self.active_channel_idx if channel is None else self._channel_index_from_number(channel)
+
         if message:
-            if self.warning_btn:
-                messages = [m.strip() for m in message.split(',') if m.strip()]
-                new_messages = []
-
-                for msg in messages:
-                    if msg not in self.error_messages:
-                        self.error_messages.append(msg)
-                        new_messages.append(msg)
-
-                if new_messages:
-                    if len(new_messages) == 1:
-                        QMessageBox.warning(self, "Aviso", new_messages[0])
-                    else:
-                        QMessageBox.warning(self, "Aviso", '\n'.join(new_messages))
-            else:
-                # Cria um novo botão de aviso
+            # Garante que o botão/ícone exista (indicador minimizado visível para todos os canais)
+            if not self.warning_btn:
                 self.warning_btn = QPushButton()
                 self.warning_hlay.addWidget(self.warning_btn)
                 cur_dir = os.path.dirname(os.path.abspath(argv[0]))
                 icon = os.path.join(cur_dir, "img", "warning.png")
                 self.warning_btn.setIcon(QIcon(icon))
+                # Ao clicar, mostra os avisos agregados do canal ativo
+                self.warning_btn.clicked.connect(lambda: QMessageBox.warning(self, "Aviso", '\n'.join(self._gather_active_warnings())))
 
-            # Cria conexão com botão e atualiza mensagem a exibir
-                self.warning_btn.clicked.connect(lambda: QMessageBox.warning(self, "Aviso", message))
+            messages = [m.strip() for m in message.split(',') if m.strip()]
 
-        elif self.warning_btn is not None:
-            # Remove o botão de aviso se não houver mensagem
-            self.warning_hlay.removeWidget(self.warning_btn)
-            self.warning_btn.clicked.disconnect()
-            self.warning_btn.deleteLater()
-            self.warning_btn = None
+            # Garante que o estado do canal tenha a lista de avisos
+            state = self.channel_states.setdefault(target_idx, self._default_channel_state())
+            channel_warnings = state.setdefault('warnings', [])
+
+            for msg in messages:
+                # Adiciona à lista minimizada deste canal para que o ícone indique
+                if msg not in channel_warnings:
+                    channel_warnings.append(msg)
+
+                # Exibe o popup apenas se nenhum outro canal já tiver mostrado a mesma mensagem
+                if msg not in self._warning_popup_shown:
+                    # Registra qual canal exibiu o popup
+                    self._warning_popup_shown[msg] = target_idx
+                    QMessageBox.warning(self, "Aviso", msg)
+
+        else:
+            # Se não houver mensagem, remove o botão e limpa avisos de todos os canais
+            if self.warning_btn is not None:
+                self.warning_hlay.removeWidget(self.warning_btn)
+                try:
+                    self.warning_btn.clicked.disconnect()
+                except Exception:
+                    pass
+                self.warning_btn.deleteLater()
+                self.warning_btn = None
+            # Limpa avisos por canal e o registro de popups exibidos
+            for st in self.channel_states.values():
+                if 'warnings' in st:
+                    st['warnings'].clear()
+            self._warning_popup_shown.clear()
+
+    def _gather_active_warnings(self) -> list[str]:
+        """Retorna os avisos agregados para o canal atualmente ativo."""
+        state = self.channel_states.get(self.active_channel_idx, {})
+        return state.get('warnings', [])
 
     def _update_fixed_list(self, button: QPushButton):
         """
@@ -1826,8 +2054,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     x, y = self.fixed_traces[str(button)]
                     color = button.palette().color(QPalette.ColorRole.Button)
                     self.spectraPlotWidget.plot(x, 
-                                                preprocess_plot_data(y, self.apodization_methods, 
-                                                    self.savgol_window_points, self.savgol_polyorder, self.apodization),
+                                                preprocess_plot_data(y, self.window_methods, 
+                                                    self.savgol_window_points, self.savgol_polyorder, self.window),
                                                 pen=pg.mkPen(color, width=1))
                 else:
                     x_vals, y_vals = zip(*self.spectra_data)
@@ -1850,8 +2078,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             if not self._running:
                 color = button.palette().color(QPalette.ColorRole.Button)
                 self.spectraPlotWidget.plot(x, 
-                                            preprocess_plot_data(y, self.apodization_methods, 
-                                                self.savgol_window_points, self.savgol_polyorder, self.apodization),
+                                            preprocess_plot_data(y, self.window_methods, 
+                                                self.savgol_window_points, self.savgol_polyorder, self.window),
                                             pen=pg.mkPen(color, width=1))
         else:
             idx = self._list_fix_buttons().index(button)
@@ -1884,6 +2112,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 pass
             self.timer.deleteLater()
             self.timer = None
+        self._cycle_started_at = None
+        self._cycle_pending_responses = 0
 
         if self.flush_timer is not None:
             if self.flush_timer.isActive():
@@ -1980,16 +2210,22 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
     def toggle_thread(self):
         """
         Inicia ou para a thread de aquisição de dados com lógica de toggle.
+        No modo contínuo, parar é definitivo (não há pausa, apenas interrupção).
         
         """
         if not self.continuous_chk.isChecked():
             QApplication.instance().setOverrideCursor(Qt.WaitCursor)
             self.stop_btn.setEnabled(False) # Evita múltiplos cliques durante a transição
         try:
-            if self.continuous_timer is not None:
+            if self.continuous_chk.isChecked() and self._running:
+                # No modo contínuo, parar é definitivo
                 self._flush_continuous_buffer(force=True)
                 self._cleanup_thread()
-                QMessageBox.warning(self, "Amostra Contínua", "Amostra contínua interrompida pelo usuário.")
+                QMessageBox.information(
+                    self,
+                    "Amostra Contínua",
+                    f"A amostra \"{self.sample_name}\" foi interrompida e salva com sucesso."
+                )
             elif self.thread is not None:
                 if self._running:
                     self._pause_thread()
@@ -2002,18 +2238,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self.stop_btn.setEnabled(True)
             raise
 
-    def continuous_timer_shot(self):
-        """
-        Callback chamado quando o timer da amostra contínua dispara.
-        Para a aquisição de dados e informa o usuário.
-        
-        """
-        self._flush_continuous_buffer(force=True)
-        QMessageBox.information(
-            self,
-            "Amostra Contínua",
-            f"A amostra \"{self.sample_name}\" coletada por {self.sample_duration} segundos foi salva com sucesso."
-        )
+
 
     def _flush_continuous_buffer(self, force: bool = False):
         """
@@ -2082,7 +2307,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         QApplication.instance().restoreOverrideCursor()
         self.stop_btn.setEnabled(True)
-        self._show_warning(warning)
+        self._show_warning(warning, channel)
 
         target_idx = self._channel_index_from_number(channel)
         if target_idx not in self.channel_states:
@@ -2137,10 +2362,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # Isso garante consistência entre o que é visto e o que é usado em find_peaks/fit.
         power_processed = preprocess_plot_data(
             power,
-            self.apodization_methods,
+            self.window_methods,
             self.savgol_window_points,
             self.savgol_polyorder,
-            self.apodization,
+            self.window,
         )
 
         # Wavelength em metros para o processamento
@@ -2157,10 +2382,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         intensities = np.asarray(interp_fn(self.fixed_wavelengths), dtype=np.float32)
         now = datetime.now().timestamp()
 
-        fiber_type = self.config_data.get('fiber')
-        if fiber_type in ('FBG', 'Interferômetro'):
-            # No modo Interferômetro, restringe a detecção à ROI espectral selecionada.
-            if fiber_type == 'Interferômetro':
+        fiber_type = self._fiber_mode()
+        if fiber_type in ('FBG', 'INT'):
+            # No modo INT, restringe a detecção à ROI espectral selecionada.
+            if fiber_type == 'INT':
                 roi_min, roi_max = self.roi_region.getRegion()
                 logger.debug(f"Processando espectros dentro da ROI: {roi_min:.2f} a {roi_max:.2f}")
                 roi_m_min = roi_min * display_to_m
@@ -2182,8 +2407,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     prominence=self.peak_detection_params['prominence'],
                     distance=self.peak_detection_params['distance'],
                     width=self.peak_detection_params['width'],
-                    valley=(fiber_type == 'Interferômetro'),
-                    fit_model='lorentz' if fiber_type == 'Interferômetro' else 'gaussian',
+                    valley=(fiber_type == 'INT'),
+                    fit_model='lorentz' if fiber_type == 'INT' else 'gaussian',
                 ) or []
 
             peak_values = [float(item['wavelength']) for item in peak_results]
@@ -2204,11 +2429,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.pending_hdf5['Picos'].append(peak_values)
                 self._flush_continuous_buffer()
 
-            if len(self.results_df['Timestamp']) == 1:
+            if len(self.results_df['Timestamp']) < 3:
                 self.spectraPlotWidget.autoRange() # Ajusta o zoom na primeira aquisição
             logger.debug(f"Processamento {fiber_type} concluído. Total de {len(self.results_df['Timestamp'])} medições acumuladas.")
-            logger.debug(f"Último conjunto detectado ({'vales' if fiber_type == 'Interferômetro' else 'picos'}): {peak_values}")
-        else:
+            logger.debug(f"Último conjunto detectado ({'vales' if fiber_type == 'INT' else 'picos'}): {peak_values}")
+        else: # LPG
             # 2. Obtém os limites da ROI selecionada pelo usuário
             roi_min, roi_max = self.roi_region.getRegion()
             logger.debug(f"Processando espectros dentro da ROI: {roi_min:.2f} a {roi_max:.2f}")
@@ -2222,7 +2447,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             # 4. Adiciona o resultado ao dicionário se um pico for encontrado
             if res_wl is not None:
                 res_wl = float(res_wl)
-                if len(self.results_df['Timestamp']) == 1:
+                if len(self.results_df['Timestamp']) < 3:
                      self.spectraPlotWidget.autoRange() # Ajusta o zoom na primeira aquisição
 
                 self.results_df['Timestamp'].append(now)
@@ -2253,7 +2478,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
     def _update_plots_with_results(self):
         """
         Atualiza os gráficos para exibir os resultados processados.
-        - Plota os inflec no gráfico de evolução temporal.
+        - Plota os pontos no gráfico de evolução temporal.
         - Desenha linhas verticais nos picos encontrados no gráfico de espectros.
         
         """
@@ -2270,9 +2495,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.temporalPlotWidget.clear()
         self.temporalPlotWidget.addItem(self.temporal_roi_region)
 
-        if self.config_data.get('fiber') in ('FBG', 'Interferômetro'):
+        if self._fiber_mode() in ('FBG', 'INT'):
             peak_series = self.results_df['Picos']
-            is_int = self.config_data.get('fiber') == 'Interferômetro'
+            is_int = self._fiber_mode() == 'INT'
 
             # Apenas picos recorrentes devem persistir em temporal/box (ruído momentâneo é descartado)
             recurring_groups = self._recurring_fbg_peak_groups(timestamps_numeric, peak_series, min_count=2)
@@ -2312,10 +2537,16 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 if last_peaks:
                     # Ordena os picos por wavelength
                     sorted_peaks = sorted(last_peaks)
+                    # Garante que chaves mapeadas não sejam reutilizadas para
+                    # múltiplos picos do mesmo espectro.
+                    used_keys: set = set()
                     for peak_value in sorted_peaks:
                         # Mantém destaque de pico apenas para grupos recorrentes.
                         match_key = self._find_matching_peak_key(recurring_groups, peak_value)
-                        color = self._get_fbg_peak_color(match_key) if match_key is not None else self.theme_colors['accent']
+                        if match_key is not None:
+                            color = self._get_fbg_peak_color(match_key, used_keys)
+                        else:
+                            color = self._get_fbg_peak_color(peak_value, used_keys)
                         line = pg.InfiniteLine(
                             pos=self._from_meter([peak_value], self.xUnit)[0],
                             angle=90,
@@ -2342,7 +2573,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         resonant_temporal = self._from_meter(valleys_m, self.resultUnit)
         resonant_spectrum = self._from_meter(valleys_m, self.xUnit)
 
-        # Plota os inflec e uma linha conectando-os
+        # Plota os pontos e uma linha conectando-os
         self.temporalPlotWidget.plot(
             x=timestamps_numeric,
             y=resonant_temporal,
@@ -2581,15 +2812,15 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             timestamps = np.asarray(self.results_df['Timestamp'], dtype=np.float64)
             intensities = self.results_df['Intensidade']
 
-            if self.config_data.get('fiber') in ('FBG', 'Interferômetro'):
+            if self._fiber_mode() in ('FBG', 'INT'):
                 peak_values = self.results_df['Picos']
                 timestamps_filtered = timestamps
                 intensities_filtered = np.asarray(intensities, dtype=np.float32)
                 resonant_filtered = peak_values
 
                 if not self._flatten_peak_values(peak_values):
-                    feature_plural = 'vales' if self.config_data.get('fiber') == 'Interferômetro' else 'picos'
-                    logger.warning("Nenhum %s detectado para salvar.", 'vale' if self.config_data.get('fiber') == 'Interferômetro' else 'pico')
+                    feature_plural = 'vales' if self._fiber_mode() == 'INT' else 'picos'
+                    logger.warning("Nenhum %s detectado para salvar.", 'vale' if self._fiber_mode() == 'INT' else 'pico')
                     QMessageBox.warning(self, "Atenção", f"Não há {feature_plural} detectados para salvar.")
                     return
             else:
@@ -2633,12 +2864,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self.file_path = file_path
             self.setWindowTitle(f"Análise de dados - {os.path.basename(file_path)}")
             # Calcula e armazena as estatísticas do box plot na escala configurada
-            if self.config_data.get('fiber') in ('FBG', 'Interferômetro'):
+            if self._fiber_mode() in ('FBG', 'INT'):
                 sample_peak_boxes = self._fbg_current_peak_samples(
                     timestamps_filtered.tolist(),
                     resonant_filtered,
-                    label_prefix="Pico" if self.config_data.get('fiber') == 'FBG' else "Vale",
-                    feature_label="Pico" if self.config_data.get('fiber') == 'FBG' else "Vale",
+                    label_prefix="Pico" if self._fiber_mode() == 'FBG' else "Vale",
+                    feature_label="Pico" if self._fiber_mode() == 'FBG' else "Vale",
                 )
                 if sample_peak_boxes:
                     self.samples[sample_name] = sample_peak_boxes
@@ -2651,6 +2882,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.samples[sample_name] = self.box_plot_statistics(resonant_for_box)
             self.samples = dict(reversed(self.samples.items())) # Mantém a ordem de inserção (última amostra salva aparece primeiro)
             self._save_active_channel_state()
+            self._save_persistent_settings()
 
         except Exception as e:
             logger.error(f"Falha ao processar ou salvar os dados: {e}")
@@ -2673,7 +2905,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 sample_values = sample_payload.get('values', [])
 
                 if dataset_name == 'Picos':
-                    feature_label = "Vale" if self.config_data.get('fiber') == 'Interferômetro' else "Pico"
+                    feature_label = "Vale" if self._fiber_mode() == 'INT' else "Pico"
                     # Reconstrói séries para separar boxplots por pico recorrente da mesma amostra
                     peak_series = [[float(v) for v in np.asarray(row, dtype=float).ravel().tolist()] for row in sample_values]
                     timestamps = list(range(len(peak_series)))
@@ -2702,6 +2934,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self.setWindowTitle(f"Análise de dados - {os.path.basename(file_path)}")
             self.file_path = file_path
             self._save_active_channel_state()
+            self._save_persistent_settings()
             logger.info(f"Dados carregados com sucesso do arquivo: {file_path}. {len(self.samples)} amostra(s) encontrada(s).")
 
         except Exception as e:
@@ -2711,7 +2944,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
     def continuous_cfg(self) -> bool:
         """
         Configura a aquisição contínua de dados.
-        Abre diálogos para o usuário inserir o nome da amostra, o caminho de salvamento e a duração da amostra.
+        Abre diálogos para o usuário inserir o nome da amostra e o caminho de salvamento.
+        A coleta ocorre continuamente até o usuário parar manualmente.
+        Os dados são salvos automaticamente a cada X amostras ou X tempo para segurança.
         Returns:
             bool: True se a configuração foi concluída com sucesso, False se o usuário cancelou em alguma etapa.
         
@@ -2729,41 +2964,29 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             logger.info("Operação de salvamento cancelada pelo usuário.")
             return False
         
-        # Abre diálogo para inserir a duração da amostra ---
-        dialog = QInputDialog(self)
-        dialog.setInputMode(QInputDialog.IntInput)
-        dialog.setWindowTitle("Duração da Amostra")
-        dialog.setLabelText("Insira a duração da amostra em segundos:")
-        dialog.setIntValue(2*self.sample_rate//1000)
-        dialog.setIntMinimum(2*self.sample_rate//1000)
-        dialog.setIntMaximum(24*3600)
-        dialog.setIntStep(1)
-        dialog.setOkButtonText("Iniciar")
-
-        if dialog.exec() == QDialog.Accepted:
-            self.sample_duration = dialog.intValue()
-        else:
-            return False # Usuário cancelou a entrada da duração da amostra
-        
         # Atualiza o caminho de salvamento para o modo contínuo
         self.file_path = file_path
         if self.enabled_channels:
             for idx in self.enabled_channels:
                 self.channel_states[idx]['file_path'] = file_path
-        logger.debug(f"Caminho de salvamento definido para o modo contínuo: {file_path}")
         
-        self.clear_plot()
-        # Interrompe a aquisição após a duração especificada
-        if self.continuous_timer is not None:
-            if self.continuous_timer.isActive():
-                self.continuous_timer.stop()
-            self.continuous_timer.deleteLater()
+        # Atualiza o título da janela para exibir o arquivo aberto
+        self.setWindowTitle(f"Análise de dados - {os.path.basename(file_path)}")
+        
+        logger.debug(f"Caminho de salvamento definido para o modo contínuo: {file_path}")
+        logger.info(f"Amostra contínua '{self.sample_name}' iniciada. Clique em 'Parar' para interromper. Os dados serão salvos automaticamente.")
 
-        self.pending_hdf5 = self._empty_result_store()
         self._save_active_channel_state()
-        self.continuous_timer = QTimer(self)
-        self.continuous_timer.setSingleShot(True)
-        self.continuous_timer.timeout.connect(self.continuous_timer_shot)
+        seeded_state = self._empty_result_store()
+        for key in seeded_state:
+            seeded_state[key] = list(self.results_df.get(key, []))
+        self.pending_hdf5 = seeded_state
+        current_state = self.channel_states.get(self.active_channel_idx)
+        if current_state is not None:
+            current_state['pending_hdf5'] = self.pending_hdf5
+
+        self._save_active_channel_state()
+        self._save_persistent_settings()
         return True
         
     def closeEvent(self, event):

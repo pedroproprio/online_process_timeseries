@@ -12,7 +12,8 @@ def append_samples(
     timestamps: np.ndarray,
     values,
     sample_name: str,
-    dataset_name: str = "Vale"):
+    dataset_name: str = "Vale",
+    extra_datasets: dict[str, list] | None = None):
     """
     Acrescenta registros no arquivo HDF5 usando o formato:
     interface -> parâmetros -> amostra -> datasets (Intensidades, Timestamp, Vale/Picos)
@@ -26,6 +27,7 @@ def append_samples(
     - values: array 1D de vales/picos correspondentes a cada registro.
     - sample_name: nome da amostra
     - dataset_name: nome do dataset de valores ('Vale' ou 'Picos').
+    - extra_datasets: datasets extras para salvar (ex.: {'NOME': [[...], [...]]}).
 
     """
     param = f"{int(range_cfg[0]*1e9)}-{int(range_cfg[1]*1e9)},{res*1e12:.1f}" # nm, nm, pm
@@ -46,6 +48,24 @@ def append_samples(
     def _store_peak_values(dataset, start_index: int, peak_values):
         for offset, peak_value in enumerate(peak_values):
             dataset[start_index + offset] = np.asarray(peak_value, dtype=np.float64)
+
+    def _store_extra_datasets(group, start_index: int, n_rows: int, extras: dict[str, list] | None):
+        if not extras:
+            return
+
+        for extra_name, extra_values in extras.items():
+            values_local = list(extra_values) if extra_values is not None else []
+            if len(values_local) == 0:
+                values_local = [[] for _ in range(n_rows)]
+            if len(values_local) != n_rows:
+                raise ValueError(
+                    f"Dataset extra '{extra_name}' incompatível com timestamps. "
+                    f"Esperado {n_rows}, recebido {len(values_local)}."
+                )
+
+            ds = _ensure_peak_dataset(group, extra_name, start_index + n_rows)
+            ds.resize((start_index + n_rows,))
+            _store_peak_values(ds, start_index, values_local)
 
     with h5py.File(file_path, "a") as f:
         if inter not in f:
@@ -89,6 +109,8 @@ def append_samples(
                     dtype="float64",
                     chunks=True
                 )
+
+            _store_extra_datasets(s, 0, len(timestamps), extra_datasets)
             return
 
         intensities_ds = s["Intensidades"]
@@ -125,6 +147,8 @@ def append_samples(
             valleys_ds = s["Vale"]
             valleys_ds.resize((n_old + n_new,))
             valleys_ds[n_old:n_old+n_new] = np.asarray(values_list, dtype=np.float64)
+
+        _store_extra_datasets(s, n_old, n_new, extra_datasets)
 
 def prompt_save_file(self) -> str:
     """

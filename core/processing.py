@@ -322,3 +322,156 @@ def preprocess_plot_data(y_values: np.ndarray, methods: dict, savgol_window_size
     if savgol_window_size > 0:
         y_values = savgol_filter(y_values, savgol_window_size, savgol_polyorder)
     return y_values
+
+def build_peak_track_fft(
+    traces: np.ndarray,
+    wavelengths_m: np.ndarray | None = None,
+    sample_rate_hz: float = 3000.0,
+    peak_prominence: float | None = None,
+    peak_distance: int | None = None,
+    peak_width: float | None = None,
+    valley: bool = False,
+) -> dict | None:
+    """
+    Extrai um traço temporal de picos (ou vales) e calcula a FFT em 3 kHz.
+
+    Args:
+        traces (np.ndarray): Matriz 2D com um espectro por linha.
+        wavelengths_m (np.ndarray | None): Eixo de comprimento de onda em metros.
+        sample_rate_hz (float): Taxa de aquisição do traço temporal.
+        peak_prominence (float | None): Prominência usada na detecção.
+        peak_distance (int | None): Distância mínima entre picos/vales detectados.
+        peak_width (float | None): Largura mínima dos picos/vales detectados.
+        valley (bool): Quando True, detecta vales em vez de picos.
+
+    Returns:
+        dict | None: Payload com o traço temporal e a FFT, ou None se inválido.
+    """
+    try:
+        traces = np.asarray(traces, dtype=float)
+        if traces.ndim == 1:
+            traces = traces[np.newaxis, :]
+
+        if traces.ndim != 2 or traces.shape[0] == 0 or traces.shape[1] == 0:
+            return None
+
+        _, n_points = traces.shape
+        if wavelengths_m is None:
+            wavelengths = np.arange(n_points, dtype=float)
+        else:
+            wavelengths = np.asarray(wavelengths_m, dtype=float).ravel()
+            if wavelengths.size != n_points:
+                logger.warning(
+                    "Eixo de comprimentos de onda incompativel com os tracos rapidos: %s != %s",
+                    wavelengths.size,
+                    n_points,
+                )
+                return None
+
+        poi_positions: list[float] = []
+        poi_amplitudes: list[float] = []
+
+        for spectrum in traces:
+            spectrum = np.asarray(spectrum, dtype=float)
+            if not np.any(np.isfinite(spectrum)):
+                continue
+
+            finite = spectrum[np.isfinite(spectrum)]
+            fill_value = float(np.median(finite)) if finite.size else 0.0
+            spectrum = np.nan_to_num(spectrum, nan=fill_value, posinf=fill_value, neginf=fill_value)
+
+            signal_for_detection = -spectrum if valley else spectrum
+            dynamic_range = float(np.max(signal_for_detection) - np.min(signal_for_detection))
+            prominence = peak_prominence if peak_prominence is not None else max(dynamic_range * 0.08, np.finfo(float).eps)
+            distance = peak_distance if peak_distance is not None else max(1, n_points // 80)
+
+            peaks, props = find_peaks(
+                signal_for_detection,
+                prominence=prominence,
+                distance=distance,
+                width=peak_width,
+            )
+
+            if peaks.size == 0:
+                poi_index = int(np.argmin(spectrum) if valley else np.argmax(spectrum))
+            else:
+                prominences = np.asarray(props.get('prominences', []), dtype=float)
+                if prominences.size == 0:
+                    poi_index = int(peaks[0])
+                else:
+                    poi_index = int(peaks[int(np.argmax(prominences))])
+
+            poi_positions.append(float(wavelengths[poi_index]))
+            poi_amplitudes.append(float(spectrum[poi_index]))
+
+        if len(poi_positions) < 2:
+            return None
+
+        peak_track = np.asarray(poi_positions, dtype=float)
+
+        if peak_track.size >= 5:
+            window_size = 5
+            kernel = np.ones(window_size, dtype=float) / window_size
+            padded = np.pad(peak_track, (window_size // 2, window_size // 2), mode='edge')
+            smoothed = np.convolve(padded, kernel, mode='valid')
+            residual = np.abs(peak_track - smoothed)
+            residual_med = float(np.median(residual))
+            residual_mad = float(np.median(np.abs(residual - residual_med)))
+            threshold = residual_med + 6.0 * residual_mad if residual_mad > 0 else residual_med * 3.0
+
+            if threshold > 0:
+                outliers = residual > threshold
+                if np.any(outliers) and np.count_nonzero(~outliers) >= 2:
+                    good_idx = np.flatnonzero(~outliers)
+                    peak_track = peak_track.copy()
+                    peak_track[outliers] = np.interp(np.flatnonzero(outliers), good_idx, peak_track[good_idx])
+
+        peak_track = np.nan_to_num(peak_track, nan=float(np.nanmedian(peak_track)))
+        peak_track = peak_track - np.mean(peak_track)
+
+        if peak_track.size < 2:
+            return None
+
+        sample_rate_hz = float(sample_rate_hz) if sample_rate_hz else 3000.0
+        if sample_rate_hz <= 0:
+            sample_rate_hz = 3000.0
+
+        window = windows.hann(peak_track.size, sym=False) if peak_track.size > 1 else np.ones(peak_track.size, dtype=float)
+        weighted_track = peak_track * window
+        fft_values = np.fft.rfft(weighted_track)
+        frequencies_hz = np.fft.rfftfreq(peak_track.size, d=1.0 / sample_rate_hz)
+        magnitudes = np.abs(fft_values)
+
+        if magnitudes.size == 0:
+            return None
+
+        magnitudes[0] = 0.0
+        reference = float(np.max(magnitudes))
+        if reference <= 0:
+            magnitudes_db = np.full_like(magnitudes, -120.0, dtype=float)
+        else:
+            magnitudes_db = 20.0 * np.log10(np.maximum(magnitudes / reference, np.finfo(float).tiny))
+
+        dominant_frequencies_hz: list[float] = []
+        if frequencies_hz.size > 1:
+            order = np.argsort(magnitudes[1:])[::-1] + 1
+            dominant_frequencies_hz = frequencies_hz[order[:3]].astype(float).tolist()
+
+        return {
+            'peak_track': {
+                'timestamps_s': (np.arange(peak_track.size, dtype=float) / sample_rate_hz).tolist(),
+                'peak_positions': peak_track.tolist(),
+                'peak_amplitudes': poi_amplitudes[:peak_track.size],
+            },
+            'fft': {
+                'frequencies_hz': frequencies_hz.astype(float).tolist(),
+                'magnitudes_db': magnitudes_db.astype(float).tolist(),
+                'dominant_frequencies_hz': dominant_frequencies_hz,
+            },
+            'sample_rate_hz': sample_rate_hz,
+            'valley': bool(valley),
+        }
+
+    except Exception as e:
+        logger.error(f"Erro ao construir a FFT do traco temporal: {e}")
+        return None
