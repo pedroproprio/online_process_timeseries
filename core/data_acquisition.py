@@ -127,7 +127,7 @@ class DataAcquisition(QObject):
             logger.error(f"Erro ao fechar dispositivo: {e}")
         self.finished.emit()
 
-    def request_data(self, n_mean: int, channel: int):
+    def request_data(self, n_mean: int, channel: int, bragg_channel: int=0):
         """
         Solicita um novo conjunto de dados do dispositivo.
         
@@ -137,7 +137,7 @@ class DataAcquisition(QObject):
         Args:
             n_mean (int): Número de amostras para média espectral.
             channel (int): Canal a ser lido (apenas para BraggMeter).
-
+            bragg_channel (int): Canal do BraggMeter a ser lido.
         """
         if self._stopping:
             return
@@ -187,7 +187,7 @@ class DataAcquisition(QObject):
                     # Valida que todos os switches foram alterados corretamente
                     max_retries = 3
                     cur_channel = -1
-                    for i in range(max_retries):
+                    for _ in range(max_retries):
                         if switch is not None:
                             cur_channel = switch.get_channel()
                             if cur_channel == channel:
@@ -198,9 +198,13 @@ class DataAcquisition(QObject):
                     if cur_channel != channel and switch is not None:
                         raise Exception(f"Falha ao configurar canal {channel} em todos os switches Sercalo.")
                 
-            spectrum, warn = device.get_osa_trace(n_mean, int(channel))
+            bragg = bool(('BRAGGMETER') in self.inter)
+            spectrum, warn = device.get_osa_trace(n_mean, bragg_channel if bragg else int(channel))
             if spectrum is not None and not self._stopping:
-                self.data_acquired.emit(spectrum, warn, int(channel))
+                emitted_channel = int(channel)
+                if switch is None and bragg:
+                    emitted_channel = int(bragg_channel)
+                self.data_acquired.emit(spectrum, warn, emitted_channel)
             elif spectrum is None and self._paused:
                 # Silent return if paused - this is expected behavior during pause
                 return

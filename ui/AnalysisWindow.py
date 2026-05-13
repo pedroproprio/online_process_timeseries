@@ -36,7 +36,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
     """
     # Sinal para indicar à ConfigWindow que esta janela está sendo fechada
     closing = Signal(str)
-    request_data_signal = Signal(int, int)
+    request_data_signal = Signal(int, int, int)
     stop_worker_signal = Signal()
 
     def __init__(self):
@@ -1142,16 +1142,33 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         if (not self._running) or self._is_stopping or self.worker is None or self.thread is None:
             return
 
-        if self.enabled_channels:
+        bragg_mode = self.config_data.get('inter') in ('BRAGGMETER FS22DI', 'BRAGGMETER FS22DI HBM')
+        bragg_channel = int(self.cfg_spin.value()) if bragg_mode else 0
+        has_switch = bool(self.config_data.get('switch_ports'))
+
+        if not has_switch:
+            self._cycle_started_at = time.monotonic()
+            self._cycle_pending_responses = 1
+            switch_channel = self._active_channel_number()
+            self.request_data_signal.emit(self.mean_samples, switch_channel, bragg_channel)
+            return
+
+        if len(self.enabled_channels) > 1:
             self._cycle_started_at = time.monotonic()
             self._cycle_pending_responses = len(self.enabled_channels)
             for tab_idx in self.enabled_channels:
-                self.request_data_signal.emit(self.mean_samples, tab_idx + 1)
+                switch_channel = tab_idx + 1
+                self.request_data_signal.emit(self.mean_samples, switch_channel, bragg_channel)
             return
 
         self._cycle_started_at = time.monotonic()
         self._cycle_pending_responses = 1
-        self.request_data_signal.emit(self.mean_samples, int(self.cfg_spin.value()))
+        if self.enabled_channels:
+            switch_channel = self.enabled_channels[0] + 1
+        else:
+            switch_channel = self._active_channel_number()
+
+        self.request_data_signal.emit(self.mean_samples, switch_channel, bragg_channel)
 
     def _arm_request_timer(self, delay_ms: int | None = None):
         """
@@ -1195,7 +1212,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self._cycle_started_at = None
         self._arm_request_timer(next_delay_ms)
 
-    def _handle_data_acquired(self, data, warning, channel: int):
+    def _handle_data_acquired(self, data, warning, channel: int, *a):
         """
         Encaminha os dados recebidos e atualiza o agendamento do próximo ciclo.
 
@@ -1846,11 +1863,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             case 'BRAGGMETER FS22DI':
                 self.cfg_lbl.setText("Canal (0-3)")
                 self.cfg_spin.setRange(2, 3) # Canais de transmissão do BraggMeter
-                self.exposure_time = -1 # Desabilita a alteração do tempo de exposição
+                self.exposure_time = -1
             case 'BRAGGMETER FS22DI HBM':
                 self.cfg_lbl.setText("Canal (0-3)")
                 self.cfg_spin.setRange(2, 3) # Canais de transmissão do BraggMeter HBM
-                self.exposure_time = -1 # Desabilita a alteração do tempo de exposição
+                self.exposure_time = -1
             case 'THORLABS CCT11':
                 self.cfg_lbl.setText("Tempo de Exposição (µs)")
                 self.cfg_spin.setRange(1000, 30000000) # Limita o tempo de exposição
@@ -2340,7 +2357,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.process_spectra()
 
         self._save_active_channel_state(save_button_state=False)
-        if target_idx != current_visible_idx:
+        no_switch_bragg = (
+            self.config_data.get('inter') in ('BRAGGMETER FS22DI', 'BRAGGMETER FS22DI HBM')
+            and not self.config_data.get('switch_ports')
+        )
+        if target_idx != current_visible_idx and not no_switch_bragg:
             self._restore_channel_state(current_visible_idx)
             self._refresh_active_channel_view(sync_buttons=False)
 

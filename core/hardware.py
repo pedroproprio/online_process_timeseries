@@ -17,6 +17,7 @@ import logging
 import socket
 import serial
 import time
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -245,44 +246,67 @@ class BraggMeter:
             numpy.ndarray: An array containing the wavelength and trace data.
             str: An warning message if the spectrum is saturated, otherwise None.
         """
-        traces = []
-        wl = None
         warn = None
+        try:
+            resp = self.ask(f'trace{channel}')
+            if not resp:
+                logger.debug('Empty response from BraggMeter for trace request')
+                return None, None
 
-        resp = self.ask(f'trace{channel}')
-        resp = resp.split(':')
+            # Try to isolate payload after ACK if present
+            ack_idx = resp.find('ACK')
+            payload = resp[ack_idx+4:] if ack_idx != -1 else resp
+            payload = payload.strip().strip('\r\n')
 
-        if self.legacy_cmds:
-            pot = resp[-1]
-            trace_raw = np.array([float(x) for x in pot.split(',')], dtype=float)
-            wl = np.linspace(1500, 1600, len(trace_raw))
-        else:
-            pot, wl_str = resp[-2], resp[-1]
-            hex_values = [pot[i:i+3] for i in range(0, len(pot), 3)]
-            trace_raw = np.array([int(hex_value, 16) for hex_value in hex_values], dtype=float)
-            wl = np.array([float(x) for x in wl_str.split(',')])
+            parts = payload.split(':')
 
-        if np.max(trace_raw) == 4095:
-            warn = "Optical connector saturated."
+            if self.legacy_cmds:
+                pot = parts[-1] if parts else ''
+                # legacy pot is comma separated numeric values
+                trace_vals = re.findall(r'[-+]?[0-9]*\.?[0-9]+', pot)
+                trace_raw = np.array([float(x) for x in trace_vals], dtype=float)
+                wl = np.linspace(1500, 1600, len(trace_raw))
+            else:
+                if len(parts) < 2:
+                    logger.debug('Incomplete response from BraggMeter (no data/wavelength part)')
+                    return None, None
+                pot, wl_str = parts[-2], parts[-1]
+                # remove any non-hex characters and join contiguous hex chunks
+                hex_chunks = re.findall(r'[0-9A-Fa-f]+', pot)
+                pot_hex = ''.join(hex_chunks)
+                # split into 3-char hex words
+                hex_values = [pot_hex[i:i+3] for i in range(0, len(pot_hex), 3) if pot_hex[i:i+3]]
+                if not hex_values:
+                    logger.debug('No hex values parsed from BraggMeter response')
+                    return None, None
+                try:
+                    trace_raw = np.array([int(hv, 16) for hv in hex_values], dtype=float)
+                except ValueError:
+                    logger.debug('Invalid hex values in BraggMeter response')
+                    return None, None
+                wl_vals = re.findall(r'[-+]?[0-9]*\.?[0-9]+', wl_str)
+                wl = np.array([float(x) for x in wl_vals], dtype=float)
 
-        if traces:
-            lengths = [len(trace) for trace in traces]
-            min_len = min(lengths)
-            if len(trace) > min_len:
-                logger.debug(f'Truncating to {min_len} samples.')
-                traces = [trace[:min_len] for trace in traces]
-                wl = wl[:min_len]
-            elif len(trace) < min_len:
-                logger.debug(f'Truncating previous traces to {min_len} samples.')
-                traces = [trace[:len(trace)] for trace in traces]
-                wl = wl[:len(trace)]
+            if trace_raw.size == 0 or wl.size == 0:
+                logger.debug('Parsed empty wavelength or trace from BraggMeter')
+                return None, None
 
-        trace = np.asarray(traces)
+            # Ensure both arrays have the same dimension by truncating to the smaller
+            min_len = min(len(wl), len(trace_raw))
+            if len(wl) != len(trace_raw):
+                logger.warning(f'Wavelength and trace length mismatch (wl={len(wl)}, trace={len(trace_raw)}). Truncating to {min_len}.')
+            wl = wl[:min_len]
+            trace_raw = trace_raw[:min_len]
 
-        min_len = min(len(wl), len(trace))
-        spec = np.stack((wl[:min_len], trace[:min_len]), axis=1)
-        spec = np.flipud(spec)
-        return spec, warn
+            if np.max(trace_raw) == 4095:
+                warn = "Optical connector saturated."
+
+            spec = np.stack((wl, trace_raw), axis=1)
+            spec = np.flipud(spec)
+            return spec, warn
+        except Exception as e:
+            logger.error(f'Erro ao ler trace do BraggMeter: {e}', exc_info=True)
+            return None, None
 
     def get_peaks(self, channel):
         """

@@ -4,7 +4,7 @@ from PySide6.QtGui import QIcon
 
 from ui.ConfigWindow_ui import Ui_ConfigWindow
 from ui.AnalysisWindow import AnalysisWindow
-from ui.FFTWindow import FFTWindow
+# from ui.FFTWindow import FFTWindow
 
 from serial.tools import list_ports
 from sys import argv
