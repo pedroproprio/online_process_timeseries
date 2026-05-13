@@ -81,7 +81,7 @@ class DataAcquisition(QObject):
             if self.switch_ports:
                 self.switch = MultiSercaloSwitch(self.switch_ports)
 
-            if self._continuous_mode and hasattr(self.device, 'start_continuous_acquisition'):
+            if self._continuous_mode:
                 self.device.start_continuous_acquisition(spectrum_averaging=self._spectrum_averaging)
                 logger.info("Modo de aquisição contínua ativado para OSA203")
         except PermissionError as e:
@@ -114,7 +114,7 @@ class DataAcquisition(QObject):
 
         try:
             logger.info(f"Fechando conexão com {self.inter}.")
-            if device is not None and hasattr(device, 'stop_continuous_acquisition'):
+            if device is not None:
                 device.stop_continuous_acquisition()
             if switch is not None:
                 switch.close()
@@ -155,18 +155,11 @@ class DataAcquisition(QObject):
             return
 
         try:
-            if self.inter == 'IBSEN IMON-512' and hasattr(device, 'get_multiple_osa_traces'):
-                spectrum, warn = device.get_multiple_osa_traces(max(1, int(n_mean)))
-                if spectrum is not None and not self._stopping:
-                    self.data_acquired.emit(spectrum, warn, 0)
-                return
-
             if switch is not None:
                 # Em modo contínuo (OSA203), apenas sincroniza sem pausas
                 if self._continuous_mode:
                     # Notifica dispositivo sobre mudança de canal para sincronização
-                    if hasattr(device, 'set_channel_info'):
-                        device.set_channel_info(channel)
+                    device.set_channel_info(channel)
 
                     # Em modo contínuo, ainda validamos que os dois switches
                     # chegaram ao mesmo canal antes de consumir o espectro.
@@ -186,8 +179,7 @@ class DataAcquisition(QObject):
                             f"Falha ao sincronizar canal {channel} em todos os switches Sercalo."
                         )
 
-                    if hasattr(device, 'flush_continuous_readout'):
-                        device.flush_continuous_readout()
+                    device.flush_continuous_readout()
                 else:
                     # Modo padrão (não contínuo): aguarda switch estar stável
                     switch.set_channel(channel)
@@ -229,22 +221,51 @@ class DataAcquisition(QObject):
             self.stop()
             return
 
-    def get_fast_traces(self):
+    def get_fast_traces(self, n: int):
         """
         Retorna os traces rápidos do IMON para análise da FFT.
 
         """
+        if self._stopping:
+            return
+
+        if self._paused:
+            return
+
+        if QThread.currentThread().isInterruptionRequested():
+            return
+
         device = self.device
-        if device is None:
-            return None
 
-        if self.inter == 'IBSEN IMON-512' and hasattr(device, 'get_multiple_osa_traces'):
-            return device.get_multiple_osa_traces(max(1, self._spectrum_averaging))[0]
+        if not hasattr(self, 'device') or device is None:
+            return
+        
+        if self.inter != 'IBSEN IMON-512':
+            return
 
-        if hasattr(device, 'get_fast_traces'):
-            return device.get_fast_traces()
-
-        return None
+        try:
+            spectrum, warn = device.get__multiple_osa_traces(n)
+            if spectrum is not None and not self._stopping:
+                self.data_acquired.emit(spectrum, warn, 0)
+            elif spectrum is None and self._paused:
+                # Silent return if paused - this is expected behavior during pause
+                return
+            elif spectrum is None:
+                logger.debug("Espectro vazio retornado (pode estar pausado ou desconectado).")
+        except SerialException as e:
+            if self._stopping:
+                return
+            logger.error(f"Dispositivo desconectado: {e}", exc_info=True)
+            self.error_occurred.emit("Erro de Comunicação", f"A conexão com o dispositivo na porta {self.port} foi perdida.")
+            self.stop()
+            return
+        except Exception as e:
+            if self._stopping:
+                return
+            logger.error(f"Ocorreu um erro durante a execução: {e}", exc_info=True)
+            self.error_occurred.emit("Erro inesperado", str(e))
+            self.stop()
+            return
 
     def pause(self):
         """
@@ -252,7 +273,7 @@ class DataAcquisition(QObject):
 
         """
         self._paused = True
-        if self._continuous_mode and self.device is not None and hasattr(self.device, 'stop_continuous_acquisition'):
+        if self._continuous_mode and self.device is not None:
             try:
                 self.device.stop_continuous_acquisition()
             except Exception as e:
@@ -264,7 +285,7 @@ class DataAcquisition(QObject):
 
         """
         if not self._stopping:
-            if self._continuous_mode and self.device is not None and hasattr(self.device, 'start_continuous_acquisition'):
+            if self._continuous_mode and self.device is not None:
                 try:
                     self.device.start_continuous_acquisition(spectrum_averaging=self._spectrum_averaging)
                 except Exception as e:
@@ -302,7 +323,7 @@ class DataAcquisition(QObject):
         Args:
             n_mean (int): Número de espectros para média.
         """
-        self._spectrum_averaging = max(1, int(n_mean))
+        self._spectrum_averaging = n_mean
 
         # Se em modo contínuo, reinicia com novo averaging
         if self._continuous_mode and hasattr(self, 'device') and self.device is not None:
