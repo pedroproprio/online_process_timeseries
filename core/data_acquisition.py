@@ -49,6 +49,7 @@ class DataAcquisition(QObject):
         self._continuous_mode = False
         self._spectrum_averaging = 1
         self._last_switch_channel: int | None = None
+        self._bragg_post_switch_discards = 1
 
     def run(self):
         """
@@ -259,8 +260,12 @@ class DataAcquisition(QObject):
             return
 
         try:
-            device.get_osa_trace(1, bragg_traces)
-            logger.debug("Aquisição dummy do BraggMeter descartada após troca de canal do switch.")
+            for _ in range(self._bragg_post_switch_discards):
+                device.get_osa_trace(1, bragg_traces)
+            logger.debug(
+                "Aquisição dummy do BraggMeter descartada %s vezes após troca de canal do switch.",
+                self._bragg_post_switch_discards,
+            )
         except Exception as e:
             # Não interrompe o ciclo por falha no dummy: tenta a leitura efetiva.
             logger.warning(f"Falha ao descartar aquisição dummy do BraggMeter: {e}")

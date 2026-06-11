@@ -505,6 +505,9 @@ class Imon512:
         self.temp = None
         self.set_format(5) # Little endian binary output
 
+    def __del__(self):
+        self.close()
+
     def close(self):
         """
         Closes the serial port connection safely.
@@ -839,6 +842,9 @@ class ThorLabsCCT:
             self.device = self.cct.connect_to_device(devices[0])
         except Exception as e:
             raise RuntimeError(f"Failed to connect to device: {e}")
+        
+    def __del__(self):
+        self.close()
 
     def close(self):
         """
@@ -924,6 +930,9 @@ class ThorLabs:
             self.device.setup(autogain=False)
         except Exception as e:
             raise RuntimeError(f"Failed to initialize device: {e}")
+        
+    def __del__(self):
+        self.close()
 
     def close(self):
         """
@@ -1134,6 +1143,9 @@ class SercaloSwitch:
             logger.error(f'Communication error after opening port: {e}')
             raise e
 
+    def __del__(self):
+        self.close()
+
     def close(self):
         if self.serial_port is not None:
             try:
@@ -1285,6 +1297,9 @@ class MultiSercaloSwitch:
                 # Fecha todos os switches já inicializados em caso de erro
                 self.close()
                 raise RuntimeError(f'Failed to initialize switch on port {port}: {e}')
+    
+    def __del__(self):
+        self.close()
     
     def close(self):
         """

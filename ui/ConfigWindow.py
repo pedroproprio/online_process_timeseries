@@ -10,6 +10,7 @@ from serial.tools import list_ports
 from sys import argv
 import subprocess
 import qdarktheme
+import platform
 import os
 import re
 
@@ -48,6 +49,7 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         self.theme: str = 'dark'
         # Configurações persistentes da UI (somente campos serializáveis)
         self.settings = QSettings('LiTel', 'online_process_timeseries')
+        self._is_windows = platform.system().lower() == 'windows'
 
         self.setup_connections()
         self._load_settings()
@@ -74,6 +76,11 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
             ch.toggled.connect(self.channel_toggled)
 
         self.inter_combo.addItems(['IBSEN IMON-512', 'BRAGGMETER FS22DI', 'BRAGGMETER FS22DI HBM', 'THORLABS CCT11', 'THORLABS OSA203'])
+        if not self._is_windows:
+            for interface_name in ['THORLABS OSA203', 'THORLABS CCT11']:
+                index = self.inter_combo.findText(interface_name)
+                if index >= 0:
+                    self.inter_combo.removeItem(index)
 
     def _load_settings(self):
         """
@@ -107,6 +114,9 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         for t, val in enumerate(self.settings.value('config/bragg_traces', [True, False, False, False], type=list)):
             if t < self.t_hlay.count():
                 self.t_hlay.itemAt(t).widget().setChecked(str(val).lower() == 'true')
+
+        if self.inter_combo.currentIndex() < 0 and self.inter_combo.count() > 0:
+            self.inter_combo.setCurrentIndex(0)
         self.channel_toggled()
 
     def _apply_theme(self):
@@ -155,22 +165,51 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         """
         Retorna o endereço IPv4 da interface Ethernet, se disponível.
         """
-        cfg = subprocess.check_output('ipconfig', text=True, encoding='cp850')  # evita problemas de acentuação
-        linhas = cfg.splitlines()
-        section = False
-        for linha in linhas:
-            if not "Adaptador Ethernet Ethernet" in linha and not section:
-                continue
-            section = True
+        system = platform.system().lower()
 
-            # mídia desconectada
-            if "desconectada" in linha:
-                return None
+        try:
+            if system == 'windows':
+                cfg = subprocess.check_output('ipconfig', text=True, encoding='cp850')  # evita problemas de acentuação
+                section = False
+                for linha in cfg.splitlines():
+                    if not "Adaptador Ethernet Ethernet" in linha and not section:
+                        continue
+                    section = True
 
-            # obtém IPv4
-            ip = re.search(r"IPv4.*?:\s*([\d\.]+)", linha)
-            if ip:
-                return ip.group(1).split('.')
+                    # mídia desconectada
+                    if "desconectada" in linha:
+                        return None
+
+                    # obtém IPv4
+                    ip = re.search(r"IPv4.*?:\s*([\d\.]+)", linha)
+                    if ip:
+                        return ip.group(1).split('.')
+
+            if system == 'linux':
+                cfg = subprocess.check_output(["ip", "addr"], text=True)
+                iface = None
+                for linha in cfg.splitlines():
+                    m = re.match(r"^\d+:\s+([^:]+):", linha)
+                    if m:
+                        iface = m.group(1)
+
+                    ip = re.search(r"inet\s+([\d.]+)", linha)
+                    if ip and iface.startswith('en'): # Ethernet
+                        return ip.group(1).split('.')
+
+        except Exception:
+            return None
+
+        return None
+
+    def _port_signature(self, port) -> str:
+        """Monta uma assinatura textual da porta para filtragem multiplataforma."""
+        fields = [port.device, port.description, port.manufacturer, port.hwid]
+        return ' '.join(str(field).lower() for field in fields if field)
+
+    def _filter_ports(self, ports, keywords: list[str]):
+        """Filtra portas usando metadados disponíveis no Windows e no Linux."""
+        return [port for port in ports if any(keyword in self._port_signature(port) for keyword in keywords)]
 
     def start_analysis(self):
         """
@@ -184,12 +223,16 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         try:
             match inter:
                 case 'THORLABS CCT11':
+                    if not self._is_windows:
+                        raise RuntimeError('THORLABS CCT11 não está disponível no Linux.')
                     if self.pycct is None:
                         from sdk.pyCCT import PyCCT
                         dll_path = os.path.join(cur_dir, "sdk", "net48")
                         self.pycct = PyCCT(dll_path)
                     osa = self.pycct
                 case 'THORLABS OSA203':
+                    if not self._is_windows:
+                        raise RuntimeError('THORLABS OSA203 não está disponível no Linux.')
                     if self.pyosa is None:
                         import sdk.pyOSA as pyOSA
                         self.pyosa = pyOSA.initialize()
@@ -382,8 +425,8 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
 
         """
         ports = list_ports.comports()
-        imon = [port for port in ports if 'FTDI' in port.manufacturer]
-        switch = [port for port in ports if 'Silicon Labs' in port.manufacturer]
+        imon = self._filter_ports(ports, ['ftdi'])
+        switch = self._filter_ports(ports, ['silicon labs'])
         # Armazena todas as portas de switch detectadas
         self.switch_ports = [port.device for port in switch] if switch else []
 

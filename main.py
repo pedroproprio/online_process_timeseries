@@ -4,6 +4,7 @@ from PySide6.QtGui import QIcon
 from ui.ConfigWindow import ConfigWindow
 
 from sys import argv, path
+import platform
 import logging
 import os
 
@@ -14,7 +15,8 @@ cur_dir = os.path.dirname(os.path.abspath(__file__))
 sdk_path = os.path.join(cur_dir, "sdk")
 path.append(sdk_path)
 
-os.environ['FTSLIB_PATH'] = os.path.join(cur_dir, "sdk", "FTSLib", "FTSLib.dll")
+if platform.system().lower() == 'windows':
+    os.environ['FTSLIB_PATH'] = os.path.join(cur_dir, "sdk", "FTSLib", "FTSLib.dll")
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
