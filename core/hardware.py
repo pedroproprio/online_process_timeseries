@@ -355,7 +355,6 @@ class BraggMeter:
             spectrum = []
             
             for trace in traces:
-                warn_raw = False
                 wl_raw = []
                 power_raw = []
                 spec_count = 0
@@ -409,24 +408,28 @@ class BraggMeter:
                         logger.debug('Parsed empty wavelength or trace from BraggMeter')
                         return None, None
 
-                    # Ensure both arrays have the same dimension by truncating to the smaller
-                    min_len = min(
-                        min(len(w) for w in wl_raw),
-                        min(len(p) for p in power_raw)
-                    )
-
-                    for i, (w, p) in enumerate(zip(wl_raw, power_raw)):
-                        if len(w) != min_len or len(p) != min_len:
-                            logger.debug(f'Wavelength and trace length mismatch (wl={len(wl_raw[-1])},' 
-                                         f'trace={len(power_raw[-1])}). Truncating to {min_len}.')
-
-                    wl_raw = [w[:min_len] for w in wl_raw]
-                    power_raw = [p[:min_len] for p in power_raw]
-
-                    warn_raw = bool(np.max(power_raw[-1]) == 4095) or warn_raw
-                    
                     spec_count += 1
-                    time.sleep(0.02) # Small delay between measurements
+                    time.sleep(0.01) # Small delay between measurements
+
+                # Ensure both arrays have the same dimension by truncating to the smaller
+                min_len = min(
+                    *(len(w) for w in wl_raw),
+                    *(len(p) for p in power_raw)
+                )
+
+                for idx, (w, p) in enumerate(zip(wl_raw, power_raw)):
+                    if len(w) != min_len or len(p) != min_len:
+                        logger.debug(
+                            f'Trace {trace}, spectrum {idx}: '
+                            f'length mismatch detected '
+                            f'(wl={len(w)}, power={len(p)}). '
+                            f'Truncating both arrays to {min_len} points.'
+                        )
+
+                wl_raw = [w[:min_len] for w in wl_raw]
+                power_raw = [p[:min_len] for p in power_raw]
+
+                warn_raw = any(np.max(p) == 4095 for p in power_raw)
 
                 trace_wavelengths.append(np.mean(wl_raw, axis=0))
                 trace_powers.append(np.mean(power_raw, axis=0))

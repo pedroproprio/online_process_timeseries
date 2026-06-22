@@ -473,10 +473,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # Usa padrão específico do instrumento se não houver valor salvo
         key_mean = self._analysis_mode_key('mean_samples')
         if key_mean:
-            if isinstance(self.config_data, dict):
-                inter = str(self.config_data.get('inter', '')).strip()
-                if inter == 'THORLABS OSA203':
-                    self.mean_samples = 1
             saved_mean = self.settings.value(key_mean, self.mean_samples, type=int)
             self.mean_samples = int(saved_mean)
         
@@ -1916,7 +1912,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             'Número de espectros:',
             self.mean_samples,
             1,
-            10000 if self.config_data.get('inter') != 'THORLABS OSA203' else 1,
+            1000,
             1,
         )
         if not accepted:
