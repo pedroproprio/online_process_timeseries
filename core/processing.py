@@ -341,6 +341,56 @@ def preprocess_plot_data(y_values: np.ndarray, methods: dict, savgol_window_size
         
     return y_values
 
+def convert_y_axis_unit(
+    values: np.ndarray,
+    mode: str = 'linear',
+    epsilon: float = 1e-12,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """
+    Aplica a transformação do eixo Y para visualização.
+
+    Em modo log:
+    - valores positivos usam 10*log10(valor)
+    - valores negativos usam o log do inverso, com sinal preservado
+    - valores nulos recebem epsilon antes da transformação
+
+    Args:
+        values (np.ndarray): Valores do eixo Y.
+        mode (str): Modo do eixo, 'linear' ou 'log'.
+        x_values (np.ndarray | None): Valores correspondentes do eixo X, quando houver.
+        epsilon (float): Valor mínimo substituto para entradas nulas.
+
+    Returns:
+        np.ndarray | tuple[np.ndarray, np.ndarray]: Valores transformados, com X opcional.
+    """
+    y_values = np.asarray(values, dtype=float)
+
+    if mode != 'log':
+        return y_values
+
+    transformed = np.full_like(y_values, np.nan, dtype=float)
+    finite_mask = np.isfinite(y_values)
+    if not np.all(finite_mask):
+        invalid_count = int(np.size(y_values) - np.count_nonzero(finite_mask))
+        if invalid_count > 0:
+            logger.warning(
+                "Valores não finitos encontrados no eixo Y; %d ponto(s) foram ignorado(s) no modo log.",
+                invalid_count,
+            )
+
+    positive_mask = finite_mask & (y_values > 0)
+    negative_mask = finite_mask & (y_values < 0)
+    zero_mask = finite_mask & (y_values == 0)
+
+    if np.any(positive_mask):
+        transformed[positive_mask] = 10.0 * np.log10(y_values[positive_mask])
+    if np.any(negative_mask):
+        transformed[negative_mask] = -10.0 * np.log10(np.abs(y_values[negative_mask]))
+    if np.any(zero_mask):
+        transformed[zero_mask] = 10.0 * np.log10(epsilon)
+
+    return transformed
+
 def build_peak_track_fft(
     traces: np.ndarray,
     wavelengths_m: np.ndarray | None = None,

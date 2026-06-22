@@ -2264,7 +2264,7 @@
      <x>0</x>
      <y>0</y>
      <width>1425</width>
-     <height>22</height>
+     <height>23</height>
     </rect>
    </property>
    <widget class="QMenu" name="menuHelp">
@@ -2302,8 +2302,16 @@
      <addaction name="actionNm"/>
      <addaction name="actionPm"/>
     </widget>
+    <widget class="QMenu" name="menuUnidade_eixo_y">
+     <property name="title">
+      <string>Unidade eixo-y</string>
+     </property>
+     <addaction name="actionLin"/>
+     <addaction name="actionLog"/>
+    </widget>
     <addaction name="menuTema"/>
     <addaction name="menuUnidade_eixo_x"/>
+    <addaction name="menuUnidade_eixo_y"/>
     <addaction name="actionPeaks"/>
    </widget>
    <widget class="QMenu" name="menuArquivo">
@@ -2394,6 +2402,22 @@
   <action name="actionSwitch">
    <property name="text">
     <string>Sercalo Switch</string>
+   </property>
+  </action>
+  <action name="actionLin">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>linear</string>
+   </property>
+  </action>
+  <action name="actionLog">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>log</string>
    </property>
   </action>
  </widget>

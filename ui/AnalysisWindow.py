@@ -5,7 +5,7 @@ from PySide6.QtCore import Signal, QThread, QTimer, Qt, QLocale, QSettings
 
 from ui.AnalysisWindow_ui import Ui_AnalysisWindow
 from ui.toggle import ToggleSwitch
-from core.processing import find_resonant_wavelength, find_wavelength_peaks, preprocess_plot_data
+from core.processing import find_resonant_wavelength, find_wavelength_peaks, preprocess_plot_data, convert_y_axis_unit
 from core.data_acquisition import DataAcquisition
 from iobound.file_manager import append_samples, prompt_save_file, prompt_open_file, load_samples
 
@@ -80,8 +80,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.results_df = self._empty_result_store()
         # Dicionário com os dados das amostras para o box plot
         self.samples = {}
-        # Tempo de exposição (µs)
-        self.exposure_time: float = 0.0
+        # Tempo de exposição (µs) ou ganho
+        self.cfg_value: float = 0.0
+        # Ganho por trace do BraggMeter HBM: {trace_number: float}
+        # Inicializado em load_config após conhecer os traces ativos
+        self.trace_gain_values: dict[int, float] = {}
         # Intervalo entre amostras (ms)
         self.sample_rate: int = 0
         # Nome da amostra contínua
@@ -102,6 +105,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.xUnit: str = 'nm'
         # Unidade fixa para temporal/boxplot (não muda com actions de unidade)
         self.resultUnit: str = 'nm'
+        # Modo de escala do eixo y da visualização temporal/box
+        self.yUnit: str = 'linear'
         # Tema atual persistido
         self.theme: str = 'dark'
         self.theme_colors = {}
@@ -159,7 +164,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.savgol_window_points: int = 51
         self.savgol_polyorder: int = 2
         # Numero de amostras para a média espectral
-        self.mean_samples: int = 10
+        self.mean_samples: int = 1
 
         # Thread e worker para aquisição de dados
         self.thread: QThread | None = None
@@ -190,7 +195,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         
         """
         # --- Configuração do gráfico: Espectro ---
-        self.spectraPlotWidget.setLabel('left', 'Potência', units='dBm')
+        if self.yUnit == 'log':
+            self.spectraPlotWidget.setLabel('left', 'log10(Potência)', units=None)
+        else:
+            self.spectraPlotWidget.setLabel('left', 'Potência', units=self._get_power_unit_label())
         self.spectraPlotWidget.showGrid(x=True, y=True)
         xAxis = pg.AxisItem(orientation='bottom')
         xAxis.setLabel(text='Comprimento de Onda', units='nm')
@@ -202,18 +210,18 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         # --- Configuração do gráfico: Evolução Temporal ---
         self.temporalPlotWidget.setLabel('bottom', 'Timestamp')
-        self.temporalPlotWidget.showGrid(x=False, y=True)
-        self.temporalPlotWidget.setAxisItems({'bottom': pg.DateAxisItem()})
         yAxis = pg.AxisItem(orientation='left')
-        yAxis.setLabel(text='Comprimento de Onda', units='nm')
         yAxis.enableAutoSIPrefix(False) # Mantém unidades em nm
         self.temporalPlotWidget.setAxisItems({'left': yAxis})
+        self.temporalPlotWidget.showGrid(x=False, y=True)
+        self.temporalPlotWidget.setAxisItems({'bottom': pg.DateAxisItem()})
 
         # --- Configuração do gráfico: Box Plot ---
         self.boxPlot = self.boxPlotWidget.addPlot()
         self.boxLegend = self.boxPlot.addLegend()
         self.boxPlot.setXRange(0, 2)
         self.boxPlot.getAxis('bottom').setTicks([]) # Remove os números do eixo X
+        self._set_result_axis_unit()
 
     def setup_connections(self):
         """
@@ -240,10 +248,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.actionUm.triggered.connect(lambda: self.unit_changed('um'))
         self.actionNm.triggered.connect(lambda: self.unit_changed('nm'))
         self.actionPm.triggered.connect(lambda: self.unit_changed('pm'))
+        self.actionLin.triggered.connect(lambda: self.y_unit_changed('linear'))
+        self.actionLog.triggered.connect(lambda: self.y_unit_changed('log'))
         self.actionLight.triggered.connect(lambda: self.set_theme('light'))
         self.actionDark.triggered.connect(lambda: self.set_theme('dark'))
         self.actionHelp.triggered.connect(lambda: webbrowser.open(
-            'https://github.com/pedroproprio/online_process_timeseries/'))
+            'https://github.com/pedroproprio/online_process_timeseries/blob/main/README.md'))
         self.actionImon.triggered.connect(lambda: webbrowser.open(
             'https://ftdichip.com/drivers/'))
         self.actionSwitch.triggered.connect(lambda: webbrowser.open(
@@ -276,6 +286,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         for i, button in enumerate(self._list_fix_buttons()):
             button.setShortcut(f'{i+1}') # Atalhos 1-6 para fixar espectros
 
+        # Ganho/tempo de exposição
+        self.cfg_spin.valueChanged.connect(self._on_cfg_spin_changed)
+
         # Tabs
         self.tabWidget.currentChanged.connect(self._on_tab_changed)
 
@@ -295,7 +308,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.actionUm.setChecked(self.xUnit == 'um')
         self.actionNm.setChecked(self.xUnit == 'nm')
         self.actionPm.setChecked(self.xUnit == 'pm')
+        saved_y_unit = self.settings.value('analysis/y_unit', self.yUnit, type=str)
+        self.yUnit = saved_y_unit if saved_y_unit in ('linear', 'log') else 'linear'
+        self.actionLin.setChecked(self.yUnit == 'linear')
+        self.actionLog.setChecked(self.yUnit == 'log')
         self._set_spectrum_axis_unit()
+        self._set_result_axis_unit()
 
     def _save_persistent_settings(self):
         """
@@ -319,6 +337,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         x_unit_value = self.xUnit if self.xUnit in ('m', 'um', 'nm', 'pm') else 'nm'
         self.settings.setValue('analysis/x_unit', x_unit_value)
+        y_unit_value = self.yUnit if self.yUnit in ('linear', 'log') else 'linear'
+        self.settings.setValue('analysis/y_unit', y_unit_value)
         self._save_roi_for_current_mode()
         self.settings.sync()
 
@@ -648,14 +668,137 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             'in_view_trace': trace_number,
         }
 
+    def _is_hbm_braggmeter(self) -> bool:
+        """Returns True when the active interface is the HBM BraggMeter variant."""
+        return bool(self.config_data and self.config_data.get('inter') == 'BRAGGMETER FS22DI HBM')
+
+    def _current_cfg_trace_number(self) -> int | None:
+        """Returns the active Bragg trace that should drive cfg_spin, when applicable."""
+        if not self._is_hbm_braggmeter():
+            return None
+        return self._active_trace_number()
+
+    def _sync_cfg_spin_for_trace(self, trace_number: int | None = None, refresh_from_worker: bool = False):
+        """
+        Sincroniza cfg_spin com o ganho do trace selecionado.
+
+        Quando refresh_from_worker=True, consulta o worker via get_cfg_value e
+        atualiza trace_gain_values (usado na inicialização e após confirmação de set).
+        Caso contrário, usa o valor já armazenado em trace_gain_values sem
+        comunicação com o hardware — chamadas de troca de aba não devem fazer get.
+        """
+        if not self._is_hbm_braggmeter():
+            return
+
+        trace_number = self._current_cfg_trace_number() if trace_number is None else trace_number
+        if trace_number is None:
+            return
+
+        if refresh_from_worker:
+            if self.worker is None:
+                return
+            try:
+                value = self.worker.get_cfg_value(trace_number)
+            except Exception:
+                logger.debug("Falha ao ler ganho do trace %s.", trace_number)
+                return
+
+            if isinstance(value, str):
+                value = value.strip()
+                if not value or ',' in value:
+                    logger.debug("Resposta nao escalar ao ler ganho do trace %s: %r", trace_number, value)
+                    return
+                try:
+                    value = float(value.split(':')[-1])
+                except Exception:
+                    logger.debug("Resposta invalida ao ler ganho do trace %s: %r", trace_number, value)
+                    return
+            elif not isinstance(value, (int, float, np.integer, np.floating)):
+                logger.debug("Resposta invalida ao ler ganho do trace %s: %r", trace_number, value)
+                return
+
+            value = float(value)
+            # Atualiza a memoria local com o valor confirmado pelo hardware
+            self.trace_gain_values[trace_number] = value
+        else:
+            # Troca de aba: usa apenas o valor ja em memoria, sem consultar o hardware
+            value = self.trace_gain_values.get(trace_number)
+            if value is None:
+                return
+            value = float(value)
+
+        self.cfg_spin.blockSignals(True)
+        try:
+            self.cfg_spin.setValue(value)
+        finally:
+            self.cfg_spin.blockSignals(False)
+
+        self.cfg_value = value
+
+    def _on_cfg_spin_changed(self, value: int):
+        """
+        Callback chamado quando cfg_spin é alterado pelo usuário.
+
+        Para o BraggMeter HBM: só atua enquanto a aquisição está pausada; envia
+        o comando set_cfg_value ao worker apenas se o valor for diferente do
+        ganho atualmente armazenado para o trace ativo, e depois faz um get de
+        confirmação para atualizar cfg_value / trace_gain_values.
+
+        Para outras interfaces: o comportamento é idêntico ao anterior (salva o
+        valor em cfg_value para ser aplicado no próximo _thread_started).
+        """
+        if self._running:
+            # Não deve ser possível (cfg_spin fica desabilitado durante aquisição),
+            # mas garante idempotência contra chamadas espúrias.
+            return
+
+        if not self._is_hbm_braggmeter():
+            # Demais interfaces: apenas memoriza; será aplicado ao retomar/iniciar.
+            self.cfg_value = float(value)
+            return
+
+        # --- BraggMeter HBM ---
+        trace_number = self._current_cfg_trace_number()
+        if trace_number is None:
+            return
+
+        stored = self.trace_gain_values.get(trace_number)
+        new_val = float(value)
+
+        if stored is not None and new_val == stored:
+            # Valor não mudou; nada a fazer.
+            return
+
+        # Armazena o novo valor pretendido
+        self.trace_gain_values[trace_number] = new_val
+        self.cfg_value = new_val
+
+        if self.worker is None:
+            # Sem worker ativo: apenas memoriza para aplicar ao iniciar.
+            return
+
+        try:
+            self.worker.set_cfg_value(new_val, trace_number)
+            logger.debug("Ganho do trace %s alterado para %s.", trace_number, new_val)
+        except Exception:
+            logger.warning("Falha ao enviar set_cfg_value para trace %s.", trace_number)
+            self._show_error("Falha ao configurar ganho",
+                             f"Não foi possível alterar o ganho do trace {trace_number}.")
+            return
+
+        # Confirmação: lê de volta o valor aplicado
+        self._sync_cfg_spin_for_trace(trace_number=trace_number, refresh_from_worker=True)
+
     def _is_braggmeter(self) -> bool:
         """ 
         Returns:
             bool: True se a interface for um BraggMeter, False caso contrário.
 
         """
+        if not isinstance(self.config_data, dict):
+            return False
         inter = self.config_data.get('inter')
-        return 'BRAGGMETER' in inter
+        return inter is not None and 'BRAGGMETER' in inter
 
     def _active_bragg_traces(self) -> list[int]:
         """
@@ -1017,8 +1160,16 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         for idx, (plot_widget, _) in enumerate(plot_specs):
             if plot_widget is None:
                 continue
+            # Left axis label should follow the current y-mode (linear/log)
+            if self.yUnit == 'log':
+                left_label = 'log10(Potência)'
+                left_units = None
+            else:
+                left_label = 'Potência'
+                left_units = self._get_power_unit_label()
+
             if idx == 0:
-                plot_widget.setLabel('left', 'Potência', units='dBm')
+                plot_widget.setLabel('left', left_label, units=left_units)
             else:
                 plot_widget.setLabel('left', '')
             plot_widget.showGrid(x=(idx == 0), y=(idx == 0))
@@ -1068,8 +1219,16 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             plot_widget.clear()
             if legend is not None:
                 legend.clear()
+            # Define label esquerdo de acordo com modo y (linear/log) e interface
+            if self.yUnit == 'log':
+                left_label = 'log10(Potência)'
+                left_units = None
+            else:
+                left_label = 'Potência'
+                left_units = self._get_power_unit_label()
+
             if idx == 0:
-                plot_widget.setLabel('left', 'Potência', units='dBm')
+                plot_widget.setLabel('left', left_label, units=left_units)
             else:
                 plot_widget.setLabel('left', '')
             plot_widget.showGrid(x=(idx == 0), y=(idx == 0))
@@ -1113,6 +1272,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     self.savgol_polyorder,
                     self.window,
                 )
+                y_vals = convert_y_axis_unit(y_vals, self.yUnit)
 
                 self.braggMergePlotWidget.plot(
                     x_vals,
@@ -1135,13 +1295,20 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         if not hasattr(self, 'merge_plot_specs'):
             return
-
         for idx, (plot_widget, legend) in enumerate(self.merge_plot_specs):
             plot_widget.clear()
             if legend is not None:
                 legend.clear()
+            # Define label esquerdo de acordo com modo y (linear/log) e interface
+            if self.yUnit == 'log':
+                left_label = 'log10(Potência)'
+                left_units = None
+            else:
+                left_label = 'Potência'
+                left_units = self._get_power_unit_label()
+
             if idx == 0:
-                plot_widget.setLabel('left', 'Potência', units='dBm')
+                plot_widget.setLabel('left', left_label, units=left_units)
             else:
                 plot_widget.setLabel('left', '')
             plot_widget.showGrid(x=(idx==0), y=(idx==0))
@@ -1180,6 +1347,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                         self.savgol_polyorder,
                         self.window,
                     )
+                    y_vals = convert_y_axis_unit(y_vals, self.yUnit)
 
                     main_name = channel_name if first_channel_curve else None
                     self.mergePlotWidget.plot(x_vals, y_vals, pen=pg.mkPen(color, width=1), name=main_name)
@@ -1298,6 +1466,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         if 0 <= index < self.tab_bragg.count():
             self._restore_channel_state(self.active_channel_idx, trace=index)
+            if self._is_hbm_braggmeter():
+                # Troca de aba: usa apenas o valor em memória, sem consultar o hardware
+                self._sync_cfg_spin_for_trace(trace_number=index, refresh_from_worker=False)
             # Ensure UI updates immediately when user switches trace tabs,
             # even if acquisition is paused.
             self._refresh_active_channel_view(sync_buttons=True)
@@ -1415,6 +1586,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             sync_buttons (bool): Se True, sincroniza o estado dos botões de fixação. Caso contrário, mantém o estado atual dos botões.
         
         """
+        self._set_result_axis_unit()
         self.spectraPlotWidget.clear()
         self.spectraPlotWidget.addItem(self.roi_region)
         # spectraPlotWidget.clear() removeu as InfiniteLines; descarta as referências.
@@ -1597,6 +1769,52 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             'pm': 'pm',
         }.get(self.xUnit, 'nm')
         self.spectraPlotWidget.setLabel('bottom', text='Comprimento de Onda', units=unit_label)
+
+    def _set_result_axis_unit(self):
+        """
+        Atualiza o rótulo do eixo Y do gráfico de espectro conforme o modo selecionado.
+
+        """
+        if self.yUnit == 'log':
+            label_text = '10log10(Potência)'
+            units = None
+        else:
+            label_text = 'Potência'
+            units = 'dBm'
+
+        if hasattr(self, 'spectraPlotWidget'):
+            self.spectraPlotWidget.setLabel('left', text=label_text, units=units)
+
+    def _get_power_unit_label(self) -> str:
+        """
+        Retorna a unidade textual apropriada para o eixo Y baseada na interface atual.
+        Usa 'dBm' para instrumentos Thorlabs (OSA) e 'u.a.' para contagens/BraggMeter/IMON.
+        """
+        try:
+            inter = str(self.config_data.get('inter', '')).upper()
+        except Exception:
+            inter = ''
+
+        if 'THORLABS' in inter:
+            return 'dBm'
+        if 'BRAGGMETER' in inter or 'IBSEN' in inter or 'IMON' in inter:
+            return 'u.a.'
+        # fallback conservador
+        return 'dBm'
+
+    def _preprocess_y_axis(self, y_values):
+        """
+        Aplica o pré-processamento de visualização ao eixo Y do espectro.
+
+        """
+        processed = preprocess_plot_data(
+            np.asarray(y_values, dtype=float),
+            self.window_methods,
+            self.savgol_window_points,
+            self.savgol_polyorder,
+            self.window,
+        )
+        return processed
 
     def _from_meter(self, values, unit: str):
         """
@@ -1834,8 +2052,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.spectraPlotWidget.clear()
         self.spectraPlotWidget.addItem(self.roi_region)
 
-        y_values = preprocess_plot_data(y_values, self.window_methods, 
-                                        self.savgol_window_points, self.savgol_polyorder, self.window)
+        self._set_result_axis_unit()
+        y_values = self._preprocess_y_axis(y_values)
 
         brush = self._visible_spectrum_brush(x_values)
         plot_kwargs = {'pen': pg.mkPen(self.theme_colors['spectrum'], width=1),}
@@ -1844,7 +2062,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             plot_kwargs['brush'] = brush
 
         try:
-            self.spectraPlotWidget.plot(x_values, y_values, **plot_kwargs)
+            self.spectraPlotWidget.plot(x_values, convert_y_axis_unit(y_values, self.yUnit), **plot_kwargs)
         except Exception as e:
             self._show_error(f"Erro ao plotar espectro: {str(e)}")
 
@@ -1854,9 +2072,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     continue
                 color = button.palette().color(QPalette.ColorRole.Button)
                 x = np.asarray(self.fixed_traces[str(button)][0], dtype=float)
-                y = preprocess_plot_data(np.asarray(self.fixed_traces[str(button)][1], dtype=float), self.window_methods, 
-                                         self.savgol_window_points, self.savgol_polyorder, self.window)
-                self.spectraPlotWidget.plot(x, y, pen=pg.mkPen(color, width=1, style=Qt.PenStyle.DashLine))
+                y = self._preprocess_y_axis(self.fixed_traces[str(button)][1])
+                self.spectraPlotWidget.plot(x, convert_y_axis_unit(y, self.yUnit), 
+                                            pen=pg.mkPen(color, width=1, style=Qt.PenStyle.DashLine))
 
     def _list_fix_buttons(self) -> list[QPushButton]:
         """
@@ -2018,6 +2236,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             for trace_idx in range(self.tab_bragg.count()):
                 is_merge_tab = trace_idx == self.tab_bragg.indexOf(getattr(self, 'bragg_merge', None))
                 self.tab_bragg.setTabEnabled(trace_idx, is_merge_tab or trace_idx in selected_traces)
+            # Inicializa o dicionário de ganho por trace para o HBM;
+            # o get real é feito em _thread_started, que preenche esses valores.
+            if self._is_hbm_braggmeter():
+                self.trace_gain_values = {t: 0.0 for t in selected_traces}
         else:
              # Remove da tab interna
             idx = self.tab_bragg.indexOf(self.main_qwt)
@@ -2149,6 +2371,25 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self._refresh_merge_views()
         self._save_persistent_settings()
 
+    def y_unit_changed(self, unit: str):
+        """
+        Altera o modo do eixo Y do espectro entre escala linear e logarítmica.
+
+        """
+        if unit == self.yUnit:
+            self.actionLin.setChecked(unit == 'linear')
+            self.actionLog.setChecked(unit == 'log')
+            return
+
+        self.yUnit = unit if unit in ('linear', 'log') else 'linear'
+        self.actionLin.setChecked(self.yUnit == 'linear')
+        self.actionLog.setChecked(self.yUnit == 'log')
+        self._set_result_axis_unit()
+        if self.spectra_data:
+            x_vals, y_vals = zip(*self.spectra_data)
+            self._plot_spectrum_curve(np.asarray(x_vals, dtype=float), np.asarray(y_vals, dtype=float))
+        self._save_persistent_settings()
+
     def _clear_layout(self, layout):
         """
         Remove recursivamente todos os widgets e sublayouts de um layout, e depois o próprio layout.
@@ -2220,7 +2461,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.stop_btn.setText("Parar")
         self.stop_btn.setStyleSheet("QPushButton { background-color: #fd4d4d; color: white; }")
         self._is_stopping = False
-        self.cfg_spin.setEnabled(False) # Desabilita o controle de tempo de exposição
+        self.cfg_spin.setEnabled(False) # Desabilita o controle de tempo de exposição/ganho
         self.cfg_lbl.setEnabled(False)
         self.sr_spin.setEnabled(False) # Desabilita o controle de intervalo entre amostras
         self.sr_lbl.setEnabled(False)
@@ -2249,25 +2490,52 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.cfg_spin.setSingleStep(100)
             case 'BRAGGMETER FS22DI': # Remove o controle de tempo de exposição
                 self._clear_layout(self.et_vlay)
-                self.exposure_time = -1
-            case 'BRAGGMETER FS22DI HBM': # Remove o controle de tempo de exposição
-                self._clear_layout(self.et_vlay)
-                self.exposure_time = -1
+                self.cfg_value = -1
+            case 'BRAGGMETER FS22DI HBM': # Usa o layout do tempo de exposição para o ganho
+                self.cfg_lbl.setText("Ganho (0-255)")
+                self.cfg_spin.setRange(0, 255) # Limita o ganho
+                self.cfg_spin.setSingleStep(1)
             case 'THORLABS CCT11':
                 self.cfg_lbl.setText("Tempo de Exposição (µs)")
                 self.cfg_spin.setRange(1000, 30000000) # Limita o tempo de exposição
                 self.cfg_spin.setSingleStep(100)
             case 'THORLABS OSA203':
                 self.cfg_lbl.setText("Tempo de Exposição (µs)")
-                self.exposure_time = -1
+                self.cfg_value = -1
 
-        if self.exposure_time >= 0:
-            if self.exposure_time == 0:
-                self.cfg_spin.setValue(self.worker.get_exposure_time()) # Obtém o tempo de exposição atual
-                self.exposure_time = self.cfg_spin.value()
-            elif self.exposure_time != self.cfg_spin.value():
-                self.worker.set_exposure_time(self.cfg_spin.value()) # Altera o tempo de exposição
-                self.exposure_time = self.cfg_spin.value()
+        if self.cfg_value >= 0:
+            if self._is_hbm_braggmeter():
+                # Na inicialização: faz get do ganho para cada trace ativo,
+                # ou aplica set se o usuário já tinha um valor diferente do padrão.
+                active_traces = self._active_bragg_traces()
+                current_trace = self._current_cfg_trace_number()
+                for t in active_traces:
+                    stored = self.trace_gain_values.get(t, 0.0)
+                    if stored != 0.0:
+                        # Usuário definiu um ganho antes de iniciar: aplica e confirma com get
+                        try:
+                            self.worker.set_cfg_value(stored, t)
+                            logger.debug("Ganho do trace %s aplicado na inicializacao: %s.", t, stored)
+                        except Exception:
+                            logger.warning("Falha ao aplicar ganho do trace %s na inicializacao.", t)
+                    # Atualiza a memória com o valor real do hardware (get de confirmação)
+                    self._sync_cfg_spin_for_trace(trace_number=t, refresh_from_worker=True)
+                # Garante que o spin exibe o ganho do trace atualmente visível
+                if current_trace is not None:
+                    self._sync_cfg_spin_for_trace(trace_number=current_trace, refresh_from_worker=False)
+            elif self.cfg_value == 0:
+                self.cfg_spin.blockSignals(True)
+                try:
+                    self.cfg_spin.setValue(self.worker.get_cfg_value()) # Obtém o tempo de exposição/ganho atual
+                finally:
+                    self.cfg_spin.blockSignals(False)
+                self.cfg_value = self.cfg_spin.value()
+            elif self.cfg_value != self.cfg_spin.value():
+                try:
+                    self.worker.set_cfg_value(self.cfg_spin.value())  # Altera o tempo de exposição
+                    self.cfg_value = self.cfg_spin.value()
+                except Exception:
+                    self._show_error("Falha ao aplicar configuração", "Falha ao tentar alterar o tempo de exposição.")
 
     def _pause_thread(self):
         """
@@ -2288,7 +2556,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.stop_btn.setStyleSheet("QPushButton { background-color: #60fa93; color: #0f172a; }")
         self.sr_spin.setEnabled(True)
         self.sr_lbl.setEnabled(True)
-        if self.config_data.get('inter') != 'THORLABS OSA203' and self.exposure_time >= 0:
+        if self.config_data.get('inter') != 'THORLABS OSA203' and self.cfg_value >= 0:
             self.cfg_spin.setEnabled(True)
             self.cfg_lbl.setEnabled(True)
         self.continuous_chk.setEnabled(True)
@@ -2511,10 +2779,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 if checked:
                     x, y = self.fixed_traces[str(button)]
                     color = button.palette().color(QPalette.ColorRole.Button)
-                    self.spectraPlotWidget.plot(x, 
-                                                preprocess_plot_data(y, self.window_methods, 
-                                                    self.savgol_window_points, self.savgol_polyorder, self.window),
-                                                pen=pg.mkPen(color, width=1))
+                    self.spectraPlotWidget.plot(
+                        x,
+                        convert_y_axis_unit((self._preprocess_y_axis(y)), self.yUnit),
+                        pen=pg.mkPen(color, width=1),
+                    )
                 else:
                     x_vals, y_vals = zip(*self.spectra_data)
                     # Redesenha o espectro atual para limpar as curvas fixadas
@@ -2544,10 +2813,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             )
             if not self._running:
                 color = button.palette().color(QPalette.ColorRole.Button)
-                self.spectraPlotWidget.plot(x, 
-                                            preprocess_plot_data(y, self.window_methods, 
-                                                self.savgol_window_points, self.savgol_polyorder, self.window),
-                                            pen=pg.mkPen(color, width=1))
+                self.spectraPlotWidget.plot(
+                    x,
+                    convert_y_axis_unit((self._preprocess_y_axis(y)), self.yUnit),
+                    pen=pg.mkPen(color, width=1),
+                )
         else:
             idx = self._list_fix_buttons().index(button)
             item = self.fixedLines_vlay.itemAt(idx)
@@ -2653,8 +2923,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.stop_btn.setStyleSheet("QPushButton { background-color: #60fa93; color: #0f172a; }")
         self.sr_spin.setEnabled(True) # Habilita o controle de intervalo entre amostras
         self.sr_lbl.setEnabled(True)
-        if self.config_data.get('inter') != 'THORLABS OSA203' and self.exposure_time >= 0:
-            self.cfg_spin.setEnabled(True) # Habilita o controle de tempo de exposição
+        if self.config_data.get('inter') != 'THORLABS OSA203' and self.cfg_value >= 0:
+            self.cfg_spin.setEnabled(True) # Habilita o controle de tempo de exposição/ganho
             self.cfg_lbl.setEnabled(True)
         self.continuous_chk.setEnabled(True)
         self.continuous_lbl.setEnabled(True)
@@ -2962,12 +3232,14 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         display_to_m = self._unit_to_meter_factor(self.xUnit)
         wavelength *= display_to_m
 
+        # Os dados interpolados são os dados armazenados, logo devem ser crus,
+        # ou seja, sem o pré-processamento.
         interp_fn = interp1d(
             wavelength,
-            power_processed,
+            power,
             kind='linear',
             bounds_error=False,
-            fill_value=(power_processed[0], power_processed[-1])
+            fill_value=(power[0], power[-1])
         )
         intensities = np.asarray(interp_fn(self.fixed_wavelengths), dtype=np.float32)
         now = datetime.now().timestamp()
@@ -3166,7 +3438,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         valleys_m = np.asarray(self.results_df['Vale'], dtype=float)
         resonant_temporal = self._from_meter(valleys_m, self.resultUnit)
         resonant_spectrum = self._from_meter(valleys_m, self.xUnit)
-
         # Plota os pontos e uma linha conectando-os
         self.temporalPlotWidget.plot(
             x=timestamps_numeric,

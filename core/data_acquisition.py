@@ -49,7 +49,6 @@ class DataAcquisition(QObject):
         self._continuous_mode = False
         self._spectrum_averaging = 1
         self._last_switch_channel: int | None = None
-        self._bragg_post_switch_discards = 1
 
     def run(self):
         """
@@ -98,7 +97,7 @@ class DataAcquisition(QObject):
             return
         except Exception as e:
             logger.error(f"Erro ao inicializar o {self.inter}: {e}")
-            self.error_occurred.emit("Erro", f"Falha ao inicializar o {self.inter}.")
+            self.error_occurred.emit("Erro", f"Falha ao inicializar o {self.inter}: {e}.")
             self.finished.emit()
             self.device = None
             return
@@ -219,7 +218,7 @@ class DataAcquisition(QObject):
             # Para BraggMeter com switch: ao alternar entre canais, descarta uma
             # aquisição dummy imediatamente após o settle para evitar vazamento.
             if channel_switched:
-                self._discard_bragg_post_switch_dummy(device, bragg_traces)
+                self._discard_bragg_post_switch_dummy(device, n_mean, bragg_traces)
 
             if switch is not None:
                 self._last_switch_channel = channel
@@ -249,7 +248,7 @@ class DataAcquisition(QObject):
             self.stop()
             return
 
-    def _discard_bragg_post_switch_dummy(self, device: BraggMeter, bragg_traces: list[bool]):
+    def _discard_bragg_post_switch_dummy(self, device: BraggMeter, n_mean: int, bragg_traces: list[bool]):
         """
         Executa uma aquisição dummy após troca de canal do switch para BraggMeter.
 
@@ -260,12 +259,8 @@ class DataAcquisition(QObject):
             return
 
         try:
-            for _ in range(self._bragg_post_switch_discards):
-                device.get_osa_trace(1, bragg_traces)
-            logger.debug(
-                "Aquisição dummy do BraggMeter descartada %s vezes após troca de canal do switch.",
-                self._bragg_post_switch_discards,
-            )
+            device.get_osa_trace(n_mean, bragg_traces)
+            logger.debug("Aquisição dummy do BraggMeter descartada após troca de canal do switch.")
         except Exception as e:
             # Não interrompe o ciclo por falha no dummy: tenta a leitura efetiva.
             logger.warning(f"Falha ao descartar aquisição dummy do BraggMeter: {e}")
@@ -342,27 +337,35 @@ class DataAcquisition(QObject):
                     raise
             self._paused = False
 
-    def set_exposure_time(self, et: float):
+    def set_cfg_value(self, value: int | float, trace: int | None = None):
         """
-        Altera o tempo de exposição.
+        Altera o tempo de exposição/ganho.
         Args:
-            et (float): Novo tempo de exposição.
+            value (float | int): Novo tempo de exposição ou ganho.
             
         """
         if not self._stopping and hasattr(self, 'device') and self.device is not None:
-            self.device.set_exposure_time(et)
-            logger.info(f"Tempo de exposição alterado para {et}.")
+            if trace is None:
+                self.device.set_cfg_value(value)
+                logger.info(f"Tempo de exposição alterado para {value}.")
+            else:
+                self.device.set_cfg_value(value, trace)
+                logger.info(f"Ganho alterado para {value} no trace {trace}.")
 
-    def get_exposure_time(self) -> int:
+    def get_cfg_value(self, trace: int | None = None) -> int:
         """
         Returns:
-            int: o tempo de exposição atual.
+            int: o tempo de exposição/ganho atual.
 
         """
         if not self._stopping and hasattr(self, 'device') and self.device is not None:
-            et = self.device.get_exposure_time()
-            logger.info(f"Tempo de exposição atual: {et}.")
-            return et
+            if trace is None:
+                value = self.device.get_cfg_value()
+                logger.info(f"Tempo de exposição atual: {value}.")
+            else:
+                value = self.device.get_cfg_value(trace)
+                logger.info(f"Ganho atual no trace {trace}: {value}.")
+            return value
         return 0
 
     def set_spectrum_averaging(self, n_mean: int):

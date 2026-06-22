@@ -42,34 +42,21 @@ class BraggMeter:
         """
         self.legacy_cmds = legacy_cmds
         if self.legacy_cmds:
-            self.commands = {'status': 	"\000\000\000\006:STAT?\r\n".encode('ascii'),
-                            'start': 	"\000\000\000\n:ACQU:STAR\n".encode('ascii'),
-                            'stop': 	"\000\000\000\n:ACQU:STOP\n".encode('ascii'),
-                            'trace0': 	"\000\000\000\023:ACQU:OSAT:CHAN:0\n?".encode('ascii'),
-                            'trace1': 	"\000\000\000\023:ACQU:OSAT:CHAN:1\n?".encode('ascii'),
-                            'trace2': 	"\000\000\000\023:ACQU:OSAT:CHAN:2\n?".encode('ascii'),
-                            'trace3': 	"\000\000\000\023:ACQU:OSAT:CHAN:3\n?".encode('ascii'),
+            self.commands = {'status': lambda *a:    "\000\000\000\006:STAT?\r\n".encode('ascii'),
+                             'start':  lambda *a:    "\000\000\000\n:ACQU:STAR\n".encode('ascii'),
+                             'stop':   lambda *a:    "\000\000\000\n:ACQU:STOP\n".encode('ascii'),
+                             'trace?': lambda n,*a: f"\000\000\000\023:ACQU:OSAT:CHAN:{n}\n?".encode('ascii'),
                             }
         else:
-            self.commands = {'status': ":STAT?\r\n".encode('ascii'),
-                            'start':  ":ACQU:STAR\r\n".encode('ascii'),
-                            'stop':   ":ACQU:STOP\r\n".encode('ascii'),
-                            'trace0': ":ACQU:OSAT:CHAN:0?\r\n".encode('ascii'),
-                            'trace1': ":ACQU:OSAT:CHAN:1?\r\n".encode('ascii'),
-                            'trace2': ":ACQU:OSAT:CHAN:2?\r\n".encode('ascii'),
-                            'trace3': ":ACQU:OSAT:CHAN:3?\r\n".encode('ascii'),
-                            'bragg0': ":ACQU:WAVE:CHAN:0?\r\n".encode('ascii'),
-                            'bragg1': ":ACQU:WAVE:CHAN:1?\r\n".encode('ascii'),
-                            'bragg2': ":ACQU:WAVE:CHAN:2?\r\n".encode('ascii'),
-                            'bragg3': ":ACQU:WAVE:CHAN:3?\r\n".encode('ascii'),
-                            'power0': ":ACQU:POWE:CHAN:0?\r\n".encode('ascii'),
-                            'power1': ":ACQU:POWE:CHAN:1?\r\n".encode('ascii'),
-                            'power2': ":ACQU:POWE:CHAN:2?\r\n".encode('ascii'),
-                            'power3': ":ACQU:POWE:CHAN:3?\r\n".encode('ascii'),
-                            'gain0?': ":ACQU:CONF:GAIN:CHAN:0?\r\n".encode('ascii'),
-                            'gain1?': ":ACQU:CONF:GAIN:CHAN:1?\r\n".encode('ascii'),
-                            'gain2?': ":ACQU:CONF:GAIN:CHAN:2?\r\n".encode('ascii'),
-                            'gain3?': ":ACQU:CONF:GAIN:CHAN:3?\r\n".encode('ascii'),
+            self.commands = {'status': lambda *a:    ":STAT?\r\n".encode('ascii'),
+                             'start':  lambda *a:    ":ACQU:STAR\r\n".encode('ascii'),
+                             'stop':   lambda *a:    ":ACQU:STOP\r\n".encode('ascii'),
+                             'trace?': lambda n,*a: f":ACQU:OSAT:CHAN:{n}?\r\n".encode('ascii'),
+                             'bragg?': lambda n,*a: f":ACQU:WAVE:CHAN:{n}?\r\n".encode('ascii'),
+                             'power?': lambda n,*a: f":ACQU:POWE:CHAN:{n}?\r\n".encode('ascii'),
+                             'gain?':  lambda n,*a: f":ACQU:CONF:GAIN:CHAN:{n}?\r\n".encode('ascii'),
+                             'gain':   lambda n, g: f":ACQU:CONF:GAIN:CHAN:{n}:{int(g)}\r\n".encode('ascii'),
+                             'thresh': lambda n, t: f":ACQU:CONF:THRE:CHAN:{n}:{int(t)}\r\n".encode('ascii'),
                             }
         self.host = host
         self.port = port
@@ -93,7 +80,7 @@ class BraggMeter:
         if self.sock is not None:
             try:
                 self.sock.close()
-                logger.info('Successfuly closed socket.')
+                # logger.debug('Successfuly closed socket.')
             except PermissionError as e:
                 logger.debug(f'Permission error closing socket on {self.host}:{self.port}, ignoring: {e}')
             except Exception as e:
@@ -108,12 +95,8 @@ class BraggMeter:
         for attempt in range(3):
             try:
                 if self.sock is not None:
+                    self.close()
                     # logger.debug('Closing existing socket before reopening.')
-                    try:
-                        self.sock.close()
-                    except (socket.error, AttributeError):
-                        pass
-                    self.sock = None
 
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.sock.settimeout(self.timeout)
@@ -122,75 +105,187 @@ class BraggMeter:
                 time.sleep(0.05) # Small delay to ensure connection is fully established before sending commands
                 return
             except Exception as e:
-                self.sock = None
                 if attempt < 2:
                     logger.warning(
                         f'Failed to open socket to {self.host}:{self.port} on attempt {attempt + 1}/2: {e}. Retrying...')
                     time.sleep(0.1)
                 else:
+                    self.sock = None
                     logger.error(f'Failed to open socket to {self.host}:{self.port}: {e}')
                     raise ConnectionError(f'Failed to open socket: {e}')
 
-    def ask(self, key):
+    def ask(self, key: str, *args) -> str:
         """
         Sends a command to the BraggMeter device and returns the response.
 
         Args:
             key (str): The key corresponding to the command to be sent.
+            *args: Additional arguments for the command.
 
         Returns:
             str: The response from the BraggMeter device.
 
         """
-        string = self.commands[key]
-        resp = self.send(string)
-        return resp
+        return self.send(bytes(self.commands[key](*args)))
 
-    def flush(self, sock, timeout=0.01):
-        sock.setblocking(False)
-        start = time.time()
-        try:
-            while time.time() - start < timeout:
-                try:
-                    data = sock.recv(4096)
-                    if not data:
-                        break
-                except BlockingIOError:
-                    time.sleep(0.001)
-        finally:
-            sock.setblocking(True)
-
-    def send(self, string, retries=0):
+    def flush(self) -> int:
         """
-        Assure a socket connection to the BraggMeter device, sends a command, and returns the response.
+        Drena todos os bytes pendentes no buffer de recepção do SO antes de
+        emitir um novo comando.
+
+        O socket é colocado em modo não-bloqueante e chamadas a recv são
+        repetidas até que EAGAIN/EWOULDBLOCK sinalize buffer vazio, ou até que
+        o peer feche a conexão. O modo bloqueante original é sempre restaurado.
+
+        Returns:
+            int: Total de bytes descartados.
+        """
+        discarded = 0
+        self.sock.setblocking(False)
+        try:
+            while True:
+                try:
+                    chunk = self.sock.recv(65536)
+                    if not chunk: # peer fechou a conexão
+                        break
+                    discarded += len(chunk)
+                except BlockingIOError:
+                    break # EAGAIN — buffer vazio, podemos prosseguir
+        finally:
+            self.sock.setblocking(True)
+        if discarded:
+            logger.debug('Flush: %d bytes discarded from socket buffer.', discarded)
+        return discarded
+
+    def send(self, string: bytes) -> str:
+        """
+        Envia um comando ao BraggMeter e retorna a resposta de controle
+        (ACK/NACK), descartando automaticamente frames de espectro que o
+        instrumento empurre de forma assíncrona antes da resposta esperada.
+
+        Fluxo por tentativa:
+          1. flush() — descarta qualquer dado residual no buffer do SO.
+          2. sendall() — envia o comando.
+          3. _recv_frame() — lê e retorna um frame completo conforme os padrões do protocolo.
+
+        Faz tentativas sucessivas até atingir o timeout. Em caso de erro de broken pipe, reabre a conexão.
 
         Args:
-            string (str): The command to be sent.
-            retries (int): Number of retry attempts.
+            string (bytes): Comando codificado a enviar.
+            retries (int): Contador interno de tentativas de reconexão.
 
         Returns:
-            str: The response from the BraggMeter device.
-
+            str: Resposta decodificada em latin-1.
         """
-        try:
-            self.flush(self.sock)
-            self.sock.sendall(string)
-            resp = b''
-            while True:
-                chunk = self.sock.recv(4096)
+        now = time.time()
+        while True:
+            try:
+                self.flush()
+                self.sock.sendall(string)
+
+                return self._recv_frame().decode('latin-1').strip()
+            except Exception as e:
+                if time.time() - now >= self.timeout:
+                    raise TimeoutError(f'Timed out while trying to communicate: {e}')
+                self.open()
+
+    def _recv_frame(self) -> bytes:
+        """
+        Acumula chunks do socket até receber um frame completo, lidando com
+        os dois modos de terminação do protocolo BraggMeter:
+ 
+        ESPECTROS
+          • Não-legacy: b':ACK:{hex}:{floats}\\r\\n'
+          O loop acumula até encontrar b'\\r\\n'.
+          • Legacy:     b'<len>:ACK:{floats}\\r\\n'
+          O loop acumula até encontrar os <len> bytes.
+ 
+        CONTROLE   — status, gain, start/stop — podem chegar em vários chunks
+          Sem terminador b'\\r\\n' (ex: b'\\x00\\x00\\x06' + b':ACK2').
+          Detectados por: presença de b':ACK' ou b':NACK' no buffer acumulado
+ 
+        Returns:
+            bytes: Frame bruto incluindo quaisquer terminadores.
+ 
+        Raises:
+            RuntimeError: Se o frame exceder _MAX_FRAME_BYTES sem terminador ou se o máximo de tentativas for excedido.
+            ConnectionError: Se o peer fechar a conexão (recv retorna b'').
+            socket.timeout:  Se nenhum dado chegar no timeout principal.
+        """
+        buf = b''
+        if self.legacy_cmds:
+            # Lê o prefixo de 4 bytes primeiro para descobrir o tamanho esperado
+            while len(buf) < 4:
+                chunk = self.sock.recv(65536)
                 if not chunk:
-                    break
-                resp += chunk
-                if b'\n' in chunk:
-                    break
-            resp = resp.decode('latin-1')
-        except (socket.error, socket.timeout) as e:
-            logger.error(f'Socket error: {e}. Retrying...')
-            if retries > 2: # 3 attempts total
-                raise ConnectionError(f'Max retries exceeded: {e}')
-            self.open()
-            return self.send(string, retries=retries+1)
-        return resp
+                    raise ConnectionError('Connection closed by BraggMeter during recv.')
+                buf += chunk
+            expected_len = int.from_bytes(buf, 'big') # tamanho esperado
+            while len(buf) < 4 + expected_len:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    break  # fechamento esperado ao final do frame legacy
+                buf += chunk
+            return buf
+        else:
+            while True:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    if b':ACK' in buf:
+                        return buf
+                    elif b':NACK' in buf:
+                        raise RuntimeError(f'NACK received: {buf!r}')
+                    raise ConnectionError('Connection closed by BraggMeter during recv.')
+                buf += chunk
+
+                # Resposta de espectro / linha completa
+                end = buf.find(b'\r\n')
+                if end != -1:
+                    buf = buf[:end+2] # inclui o terminador
+                    if b':ACK' in buf:
+                        return buf
+                    elif b':NACK' in buf:
+                        raise RuntimeError(f'NACK received: {buf!r}')
+                    raise RuntimeError(f'Unable to obtain valid ACK: {buf!r}')
+
+                # Segurança: se acumulamos mais que um frame de espectro esperado e
+                # ainda não há '\r\n', algo está errado — retorna o que temos.
+                if len(buf) > 90_000:
+                    raise RuntimeError('Frame exceeded maximum size without terminator.')
+
+    def get_cfg_value(self, channel: int) -> str:
+        """
+        Consulta o ganho configurado para o canal especificado.
+
+        Args:
+            channel (int): Índice do canal (0–3).
+
+        Returns:
+            str: Resposta do instrumento.
+                 
+        """
+        if self.legacy_cmds:
+            logger.error('get_cfg_value not implemented for legacy commands')
+            return -1
+
+        return self.ask('gain?', channel).split(':')[-1].strip()
+
+    def set_cfg_value(self, value: int, channel: int) -> str:
+        """
+        Define o ganho para o canal especificado e aguarda confirmação.
+
+        Args:
+            value (int): Valor de ganho a configurar (0-255).
+            channel (int): Índice do canal (0–3).
+
+        Returns:
+            str: Resposta ACK/NACK do instrumento.
+        """
+        if self.legacy_cmds:
+            logger.error('set_cfg_value not implemented for legacy commands')
+            return -1
+
+        return self.ask('gain', channel, value)
 
     def start(self):
         """
@@ -267,10 +362,9 @@ class BraggMeter:
 
                 while spec_count < n_mean:
                     for retry in range(5):
-                        resp = self.ask(f'trace{trace}')
+                        resp = self.ask(f'trace?', trace)
                         if resp:
                             break
-                        self.open()
                     else:
                         raise ConnectionError(f'No response received for trace{trace} after 5 attempts.')
 
@@ -362,11 +456,11 @@ class BraggMeter:
             logger.error('get_peaks not implemented for legacy commands')
             return -1
         try:
-            lambdas = self.ask(f'power{channel}')
+            lambdas = self.ask(f'power?', channel)
         except Exception as e:
             logger.error(f'Error reading power from BraggMeter: {e}')
             self.start()
-            lambdas = self.ask(f'power{channel}')
+            lambdas = self.ask(f'power', channel)
         i = lambdas.find('ACK') + 4
         lambdas = lambdas[i:-2].split(',')
         if len(lambdas) == 0:
@@ -390,11 +484,11 @@ class BraggMeter:
             logger.error('get_bragg not implemented for legacy commands')
             return -1
         try:
-            lambdas = self.ask(f'bragg{channel}')
+            lambdas = self.ask(f'bragg?', channel)
         except Exception as e:
             logger.error(f'Error reading bragg from BraggMeter: {e}')
             self.start()
-            lambdas = self.ask(f'bragg{channel}')
+            lambdas = self.ask(f'bragg?', channel)
         i = lambdas.find('ACK') + 4
         lambdas = lambdas[i:-2].split(',')
         if len(lambdas) == 0:
@@ -402,26 +496,6 @@ class BraggMeter:
         if lambdas[0] == '':
             return []
         return [float(lamb) if lamb else 0 for lamb in lambdas]
-    
-    def set_gain(self, channel, gain):
-        """
-        Sets the gain for the specified channel.
-
-        Args:
-            channel (int): The channel number.
-            gain (str): The gain value to be set from 0 to 255.
-
-        Returns:
-            str: The response from the BraggMeter device.
-
-        """
-        if self.legacy_cmds:
-            logger.error('set_gain not implemented for legacy commands')
-            return -1
-        
-        command = f":ACQU:CONF:GAIN:CHAN:{channel}:{gain}\r\n".encode('ascii')
-        resp = self.send(command)
-        return resp
     
     def set_threshold(self, channel, threshold):
         """
@@ -438,27 +512,9 @@ class BraggMeter:
         if self.legacy_cmds:
             logger.error('set_threshold not implemented for legacy commands')
             return -1
-        command = f" :ACQU:CONF:THRE:CHAN:{channel}:{threshold}\r\n".encode('ascii')
-        resp = self.send(command)
+        resp = self.ask('thresh', channel, threshold)
         return resp
-
-    def get_gain(self, channel):
-        """
-        Retrieves the gain value for the specified channel.
-
-        Args:
-            channel (int): The channel number.
-
-        Returns:
-            str: The gain value.
-
-        """
-        if self.legacy_cmds:
-            logger.error('get_gain not implemented for legacy commands')
-            return -1
-        resp = self.ask(f'gain{channel}?')
-        return resp
-
+    
 class Imon512:
     """
     Represents an Imon512 object used for controlling and retrieving data from an Imon512 device.
@@ -801,7 +857,7 @@ class Imon512:
         warn = None if not warn else "Pixel count exceed the saturation threshold."
         return spec, warn
 
-    def set_exposure_time(self, et: int):
+    def set_cfg_value(self, et: int, *args):
         """
         Sets the exposure time of the Imon512 device.
 
@@ -812,7 +868,7 @@ class Imon512:
         self.ask(f'*para:fftpara 3000 {et} 0')
         logger.debug(f'Set integration time to {et} µs')
 
-    def get_exposure_time(self) -> int:
+    def get_cfg_value(self, *args) -> int:
         """
         Gets the exposure time of the Imon512 device.
 
@@ -877,7 +933,7 @@ class ThorLabsCCT:
         except Exception as e:
             raise RuntimeError(f"Failed to acquire spectrum: {e}")
 
-    def get_exposure_time(self) -> int:
+    def get_cfg_value(self, *args) -> int:
         """
         Gets the exposure time of the Thorlabs Compact Spectrograph.
 
@@ -893,7 +949,7 @@ class ThorLabsCCT:
         except Exception as e:
             raise RuntimeError(f"Failed to get exposure time: {e}")
 
-    def set_exposure_time(self, et: float):
+    def set_cfg_value(self, et: float, *args):
         """
         Sets the exposure time of the Thorlabs Compact Spectrograph.
 

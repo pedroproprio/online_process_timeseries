@@ -66,14 +66,10 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         self.refreshTimer = QTimer(self)
         self.refreshTimer.timeout.connect(self.update_coms)
         self.refreshTimer.start(1000) # Atualiza as portas seriais a cada segundo
-        self.ch1_radio.toggled.connect(self.channel_toggled)
         self.start_btn.setShortcut('Return') # Atalho do teclado
 
         for trace_radio in [self.t_hlay.itemAt(i).widget() for i in range(self.t_hlay.count())]:
             trace_radio.toggled.connect(self.trace_toggled)
-
-        for ch in [self.ch_hlay.itemAt(i).widget() for i in range(self.ch_hlay.count())]:
-            ch.toggled.connect(self.channel_toggled)
 
         self.inter_combo.addItems(['IBSEN IMON-512', 'BRAGGMETER FS22DI', 'BRAGGMETER FS22DI HBM', 'THORLABS CCT11', 'THORLABS OSA203'])
         if not self._is_windows:
@@ -117,7 +113,6 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
 
         if self.inter_combo.currentIndex() < 0 and self.inter_combo.count() > 0:
             self.inter_combo.setCurrentIndex(0)
-        self.channel_toggled()
 
     def _apply_theme(self):
         """
@@ -251,8 +246,8 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
             'fiber': self.fiber_combo.currentText(),
             'path': self.file_path,
             'sdk': osa,
-            'switch_ports': self.switch_ports,  # Lista de todas as portas de switch
-            'channels': [i.isChecked() for i in [self.ch_hlay.itemAt(i).widget() for i in range(self.ch_hlay.count())]],
+            'switch_ports': self.switch_ports if self.enable_switch() else None,  # Lista de todas as portas de switch
+            'channels': self.get_active_channels() if self.enable_switch() else [True, False, False, False], # Ativa o canal 1 por padrão
             'bragg_traces': self._current_trace_selection(),
             'theme': self.theme,
         }
@@ -325,6 +320,22 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         self._save_settings()
         self.show()
         self.refreshTimer.start(1000)
+
+    def enable_switch(self):
+        """
+        Analisa se há algum canal ativado para habilitar ou não o switch Sercalo.
+
+        """
+        if any(ch.isChecked() for ch in [self.ch_hlay.itemAt(i).widget() for i in range(self.ch_hlay.count())]):
+            return True
+        return False
+
+    def get_active_channels(self) -> list[bool]:
+        """
+        Retorna uma lista com o estado de cada canal (ativo ou inativo).
+
+        """
+        return [i.isChecked() for i in [self.ch_hlay.itemAt(j).widget() for j in range(self.ch_hlay.count())]]
 
     def bragg(self):
         """
@@ -408,16 +419,6 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
             case 'THORLABS OSA203':
                 self.thorlabs()
                 self.setSpins(1000, 2500, 1450, 1650)
-
-    def channel_toggled(self):
-        """
-        Habilita o botão de iniciar análise apenas se pelo menos um canal estiver selecionado.
-
-        """
-        if any(ch.isChecked() for ch in [self.ch_hlay.itemAt(i).widget() for i in range(self.ch_hlay.count())]):
-            self.start_btn.setEnabled(True)
-        else:
-            self.start_btn.setEnabled(False)
 
     def update_coms(self):
         """
