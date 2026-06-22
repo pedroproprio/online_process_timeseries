@@ -196,7 +196,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         # --- Configuração do gráfico: Espectro ---
         if self.yUnit == 'log':
-            self.spectraPlotWidget.setLabel('left', 'log10(Potência)', units=None)
+            self.spectraPlotWidget.setLabel('left', f'log10({self._get_power_unit_label()})', units=None)
         else:
             self.spectraPlotWidget.setLabel('left', 'Potência', units=self._get_power_unit_label())
         self.spectraPlotWidget.showGrid(x=True, y=True)
@@ -1785,31 +1785,25 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         """
         if self.yUnit == 'log':
-            label_text = '10log10(Potência)'
-            units = None
+            units = f'10log10({self._get_power_unit_label()})'
         else:
-            label_text = 'Potência'
-            units = 'dBm'
+            units = self._get_power_unit_label()
 
         if hasattr(self, 'spectraPlotWidget'):
-            self.spectraPlotWidget.setLabel('left', text=label_text, units=units)
+            self.spectraPlotWidget.setLabel('left', text='Potência', units=units)
 
     def _get_power_unit_label(self) -> str:
         """
         Retorna a unidade textual apropriada para o eixo Y baseada na interface atual.
-        Usa 'dBm' para instrumentos Thorlabs (OSA) e 'u.a.' para contagens/BraggMeter/IMON.
         """
         try:
             inter = str(self.config_data.get('inter', '')).upper()
         except Exception:
             inter = ''
 
-        if 'THORLABS' in inter:
+        if 'THORLABS' in inter or ('BRAGGMETER' in inter and 'HBM' not in inter):
             return 'dBm'
-        if 'BRAGGMETER' in inter or 'IBSEN' in inter or 'IMON' in inter:
-            return 'u.a.'
-        # fallback conservador
-        return 'dBm'
+        return 'u.a.'
 
     def _preprocess_y_axis(self, y_values):
         """
@@ -1937,7 +1931,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         Abre um diálogo para ajustar os parâmetros de detecção.
         
         Parâmetros:
-        - Prominência: altura mínima do pico em dBm
+        - Prominência: altura mínima do pico
         - Largura: largura mínima do pico em pontos (samples)
         - Distância: distância mínima entre picos em pontos (samples)
 
@@ -1964,7 +1958,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         distance_spin.setRange(1, 100_000)
         distance_spin.setValue(int(self.peak_detection_params['distance']))
 
-        layout.addRow('Prominência (dBm):', prominence_spin)
+        layout.addRow('Prominência (potência):', prominence_spin)
         layout.addRow('Largura (pontos):', width_spin)
         layout.addRow('Distância (pontos):', distance_spin)
 
@@ -1984,7 +1978,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         }
         self._save_persistent_settings()
         logger.info(
-            "Parâmetros de %s configurados: prominence=%s dBm, width=%s pt, distance=%s pt",
+            "Parâmetros de %s configurados: prominence=%s potência, width=%s pt, distance=%s pt",
             'vale' if is_int else 'pico',
             self.peak_detection_params['prominence'],
             self.peak_detection_params['width'],
@@ -2273,9 +2267,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self._set_spectrum_axis_unit()
 
         # Ajusta a unidade do eixo y
-        inter = config.get('inter')
-        if inter in ('IBSEN IMON-512', 'BRAGGMETER FS22DI HBM'):
-            self.spectraPlotWidget.setLabel('left', 'Potência', units='u.a.')
+        self.spectraPlotWidget.setLabel('left', 'Potência', units=self._get_power_unit_label())
 
         channels = config.get('channels')
         merge_index = self.tabWidget.indexOf(getattr(self, 'tab_merge'))
