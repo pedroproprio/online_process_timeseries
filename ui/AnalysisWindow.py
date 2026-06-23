@@ -235,7 +235,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.savgol_btn.clicked.connect(self.select_savgol_parameters)
         self.mean_btn.clicked.connect(self.select_mean_samples)
         self.actionPeaks.triggered.connect(self.select_peak_parameters)
-        self.temporal_roi_region.sigRegionChanged.connect(self.roi_changed) # Atualiza o box plot mesmo com a aquisição parada
+        self.temporal_roi_region.sigRegionChanged.connect(self._temporal_roi_changed)
         self.roi_region.sigRegionChanged.connect(self._spectrum_roi_changed)
         
         # Botões de fixar um espectro
@@ -1049,6 +1049,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
     def _fbg_current_peak_samples(
         self,
         timestamps: list[float],
+        recurring_groups: dict[float, list[tuple[float, float]]],
         peak_series: list[list[float]],
         label_prefix: str = "Atual",
         feature_label: str = "Pico",
@@ -1518,6 +1519,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         
         """
         state = self.channel_states.setdefault(index, self._default_channel_state())
+        temporal_roi_range = state.get('temporal_roi_range')
         self.active_channel_idx = index
 
         trace_number = trace if trace is not None else state.get('in_view_trace', 0)
@@ -1529,7 +1531,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         self.spectra_data = state['spectra_data']
         self.roi_range = state['roi_range']
-        temporal_roi_range = state.get('temporal_roi_range')
         self.results_df = state['results_df']
         self.results_df.setdefault('Vale', [])
         self.results_df.setdefault('Picos', [])
@@ -1543,7 +1544,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.in_view_trace = trace_number if trace_number is not None else state.get('in_view_trace')
 
         if temporal_roi_range is not None:
-            self.temporal_roi_region.setRegion(temporal_roi_range)
+            self.temporal_roi_region.blockSignals(True)
+            try:
+                self.temporal_roi_region.setRegion(temporal_roi_range)
+            finally:
+                self.temporal_roi_region.blockSignals(False)
 
         if self._is_braggmeter() and hasattr(self, 'tab_bragg'):
             trace_index = trace_number if trace is None else trace
@@ -1606,7 +1611,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         temporal_roi_range = self.channel_states[self.active_channel_idx].get('temporal_roi_range')
         if temporal_roi_range is not None:
-            self.temporal_roi_region.setRegion(temporal_roi_range)
+            self.temporal_roi_region.blockSignals(True)
+            try:
+                self.temporal_roi_region.setRegion(temporal_roi_range)
+            finally:
+                self.temporal_roi_region.blockSignals(False)
 
         if sync_buttons:
             self._sync_fix_buttons_ui()
@@ -2928,12 +2937,15 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         QApplication.instance().restoreOverrideCursor()
         self.stop_btn.setEnabled(True)
 
-    def roi_changed(self):
+    def _temporal_roi_changed(self):
         """
-        Callback chamado quando a região de interesse (ROI) é alterada.
-        Atualiza o box plot mesmo com a aquisição parada.
+        Callback chamado quando a região de interesse (ROI) temporal é alterada com a aquisição parada.
+        Atualiza o box plot com os dados filtrados pela nova ROI temporal.
         
         """
+        if self.timer is not None and self.timer.isActive():
+            return
+
         temporal_roi = self.temporal_roi_region.getRegion()
         channel_state = self.channel_states.setdefault(self.active_channel_idx, self._default_channel_state())
         channel_state['temporal_roi_range'] = temporal_roi
@@ -2944,8 +2956,19 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 trace_state = channel_state['trace_states'].setdefault(trace_number, self._default_trace_state(trace_number))
                 trace_state['temporal_roi_range'] = temporal_roi
 
-        if self.timer is None or not self.timer.isActive():
-            self._update_plots_with_results()
+        # Seleciona a ROI temporal atual para filtrar os dados computados pelo box plot
+        timestamp = self.results_df['Timestamp']
+        valleys_m = np.asarray(self.results_df['Vale'], dtype=float)
+        resonant_temporal = self._from_meter(valleys_m, self.resultUnit)
+        roi_min_ts, roi_max_ts = self.temporal_roi_region.getRegion()
+        mask = [(r >= roi_min_ts) and (r <= roi_max_ts) for r in timestamp]
+        boxplot_valleys = [resonant_temporal[i] for i in range(len(resonant_temporal)) if mask[i]]
+
+        if not boxplot_valleys and timestamp:
+            logger.warning("ROI temporal vazia para box plot, nada a plotar.")
+            return
+
+        self.update_box_plot(boxplot_valleys)
 
     def _spectrum_roi_changed(self):
         roi_min, roi_max = self.roi_region.getRegion()
@@ -3383,7 +3406,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             if self.timer is not None and timestamps_numeric:
                 roi_min = timestamps_numeric[0]
                 roi_max = timestamps_numeric[-1]
-                self.temporal_roi_region.setRegion((roi_min, roi_max))
+                self.temporal_roi_region.blockSignals(True)
+                try:
+                    self.temporal_roi_region.setRegion((roi_min, roi_max))
+                finally:
+                    self.temporal_roi_region.blockSignals(False)
 
             logger.debug("Gráfico de evolução temporal atualizado.")
 
@@ -3421,6 +3448,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
             current_peak_samples = self._fbg_current_peak_samples(
                 timestamps_numeric,
+                recurring_groups,
                 peak_series,
                 label_prefix="Atual",
                 feature_label="Vale" if is_int else "Pico",
@@ -3448,7 +3476,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         if self.timer is not None:
             roi_min = timestamps_numeric[0] # Primeiro timestamp
             roi_max = timestamps_numeric[-1] # Último timestamp
-            self.temporal_roi_region.setRegion((roi_min, roi_max)) # Ajusta a ROI temporal
+            self.temporal_roi_region.blockSignals(True)
+            try:
+                self.temporal_roi_region.setRegion((roi_min, roi_max)) # Ajusta a ROI temporal
+            finally:
+                self.temporal_roi_region.blockSignals(False)
 
         logger.debug("Gráfico de evolução temporal atualizado.")
 
@@ -3749,6 +3781,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 if self._fiber_mode() in ('FBG', 'INT'):
                     sample_peak_boxes = self._fbg_current_peak_samples(
                         timestamps_filtered.tolist(),
+                        self._recurring_fbg_peak_groups(timestamps_filtered.tolist(), resonant_filtered, min_count=2),
                         resonant_filtered,
                         label_prefix="Pico" if self._fiber_mode() == 'FBG' else "Vale",
                         feature_label="Pico" if self._fiber_mode() == 'FBG' else "Vale",
