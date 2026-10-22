@@ -490,6 +490,17 @@ class Ui_AnalysisWindow(object):
 
         self.cfg_vlay.addWidget(self.mean_btn)
 
+        self.bezier_btn = QPushButton(self.main_qwt)
+        self.bezier_btn.setObjectName(u"bezier_btn")
+        sizePolicy4.setHeightForWidth(self.bezier_btn.sizePolicy().hasHeightForWidth())
+        self.bezier_btn.setSizePolicy(sizePolicy4)
+        icon3 = QIcon()
+        icon3.addFile(u"../img/bezier.png", QSize(), QIcon.Mode.Normal, QIcon.State.Off)
+        self.bezier_btn.setIcon(icon3)
+        self.bezier_btn.setIconSize(QSize(36, 36))
+
+        self.cfg_vlay.addWidget(self.bezier_btn)
+
         self.verticalSpacer = QSpacerItem(20, 40, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
 
         self.cfg_vlay.addItem(self.verticalSpacer)
@@ -828,7 +839,7 @@ class Ui_AnalysisWindow(object):
         AnalysisWindow.setCentralWidget(self.centralwidget)
         self.menuBar = QMenuBar(AnalysisWindow)
         self.menuBar.setObjectName(u"menuBar")
-        self.menuBar.setGeometry(QRect(0, 0, 1425, 23))
+        self.menuBar.setGeometry(QRect(0, 0, 1425, 33))
         self.menuHelp = QMenu(self.menuBar)
         self.menuHelp.setObjectName(u"menuHelp")
         self.menuDrivers = QMenu(self.menuHelp)
@@ -932,6 +943,10 @@ class Ui_AnalysisWindow(object):
         self.mean_btn.setToolTip(QCoreApplication.translate("AnalysisWindow", u"M\u00e9dia espectral (M)", None))
 #endif // QT_CONFIG(tooltip)
         self.mean_btn.setText("")
+#if QT_CONFIG(tooltip)
+        self.bezier_btn.setToolTip(QCoreApplication.translate("AnalysisWindow", u"Curva de B\u00e9zier (B)", None))
+#endif // QT_CONFIG(tooltip)
+        self.bezier_btn.setText("")
         self.tab_bragg.setTabText(self.tab_bragg.indexOf(self.bragg_t0), QCoreApplication.translate("AnalysisWindow", u"Trace 0", None))
         self.tab_bragg.setTabText(self.tab_bragg.indexOf(self.bragg_t1), QCoreApplication.translate("AnalysisWindow", u"Trace 1", None))
         self.tab_bragg.setTabText(self.tab_bragg.indexOf(self.bragg_t2), QCoreApplication.translate("AnalysisWindow", u"Trace 2", None))

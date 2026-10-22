@@ -8,6 +8,7 @@ gráfica, para analisar os espectros dos sensores.
 """
 
 import logging
+from math import comb
 import numpy as np
 from scipy.optimize import curve_fit
 from scipy.signal import savgol_filter, windows, find_peaks
@@ -390,6 +391,70 @@ def convert_y_axis_unit(
         transformed[zero_mask] = 10.0 * np.log10(epsilon)
 
     return transformed
+
+def bezier_curve(
+    x: np.ndarray,
+    y: np.ndarray,
+    num_points: int = 100,
+    smoothing: float = 0.3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Gera uma curva suave usando segmentos de Bézier cúbicos.
+
+    Args:
+        x (np.ndarray): Coordenadas X dos pontos originais.
+        y (np.ndarray): Coordenadas Y dos pontos originais.
+        num_points (int): Número de pontos por segmento.
+        smoothing (float): Fator de suavização dos controles.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: Arrays X e Y da curva.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if num_points < 2:
+        return x, y
+
+    points = np.column_stack((x, y))
+
+    # Repete o último ponto
+    points = np.vstack((points, points[-1:], points[-1:], points[-1:]))
+
+    curve_x = []
+    curve_y = []
+
+    for i in range(len(points) - 3):
+        previous = points[i]
+        start = points[i + 1]
+        end = points[i + 2]
+        next_point = points[i + 3]
+
+        start_vector = end - previous
+        start_control = start + start_vector * smoothing
+
+        end_vector = start - next_point
+        end_control = end + end_vector * smoothing
+
+        # Avalia a curva de Bézier cúbica.
+        t = np.linspace(0.0, 1.0, num_points)
+        one_minus_t = 1.0 - t
+
+        segment = (
+            one_minus_t[:, None] ** 3 * start
+            + 3 * one_minus_t[:, None] ** 2 * t[:, None] * start_control
+            + 3 * one_minus_t[:, None] * t[:, None] ** 2 * end_control
+            + t[:, None] ** 3 * end
+        )
+
+        # Evita duplicar o primeiro ponto dos segmentos seguintes.
+        if i > 0:
+            segment = segment[1:]
+
+        curve_x.extend(segment[:, 0])
+        curve_y.extend(segment[:, 1])
+
+    return np.asarray(curve_x), np.asarray(curve_y)
 
 def build_peak_track_fft(
     traces: np.ndarray,

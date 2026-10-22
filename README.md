@@ -11,12 +11,12 @@ O programa faz a aquisição dos espectros ópticos, pré-processa os dados e os
 Este software:
 
 - **Conecta-se** ao aparelho de leitura (interrogador ou analisador de espectro)
-- **Captura** leituras de luz de forma contínua ou sob demanda
+- **Captura** leituras de luz de forma contínua
 - **Identifica** automaticamente o ponto de interesse no espectro (um vale ou um pico, conforme o tipo de sensor)
 - **Mostra gráficos** da evolução dessa medida ao longo do tempo
 - **Permite salvar** e comparar os dados para análise posterior
 
-Em resumo: é uma ferramenta de **monitoramento e acompanhamento** de sensores ópticos, pensada para uso em laboratório ou em bancadas de teste.
+Em suma: é uma ferramenta de **monitoramento e acompanhamento** de sensores ópticos, pensada para uso em laboratório ou em bancadas de teste.
 
 ---
 
@@ -30,17 +30,22 @@ O programa trabalha com três categorias de fibra óptica:
 | **FBG** | Gratings de Bragg em fibra — busca **picos** no espectro |
 | **Interferômetro** | Sensores interferométricos — também baseados em picos |
 
-O usuário escolhe o tipo na tela inicial; o software adapta a análise automaticamente.
+O usuário escolhe o tipo na tela inicial, o software adapta a análise automaticamente.
 
 ---
 
-## Como funciona na prática
+## Como funciona
 
 1. **Configuração** — Na janela inicial, escolhe-se o equipamento de leitura, a faixa de comprimento de onda de interesse, os canais a monitorar e o tipo de fibra.
 2. **Análise** — Abre-se a janela de análise, onde os espectros aparecem em tempo real.
 3. **Região de interesse** — É possível delimitar no gráfico ou configurar os parâmetros da faixa onde o software deve procurar a medida relevante.
 4. **Acompanhamento temporal** — Um segundo gráfico mostra como a leitura evolui segundo a segundo (ou conforme a taxa de amostragem configurada).
 5. **Gravação** — Os dados podem ser exportados em arquivo para consulta ou processamento futuro.
+
+---
+
+## Fluxo do espectro
+![](./img/fluxo.png)
 
 ---
 
@@ -74,13 +79,10 @@ pip install -r requirements.txt
 python main.py
 ```
 
-> **Dica:** Se a instalação do PySide6 falhar por erro de caminho longo no Windows, use um ambiente virtual na pasta do projeto (como acima) ou habilite o suporte a caminhos longos nas configurações do sistema.
-
 ---
 
 ## Observações
 
-- O programa **precisa do hardware conectado** para capturar dados reais. Sem o equipamento, a interface abre normalmente, mas a conexão com o sensor falhará.
 - As preferências de configuração (faixa de onda, tipo de fibra, tema claro/escuro etc.) são lembradas entre sessões.
 
 ---

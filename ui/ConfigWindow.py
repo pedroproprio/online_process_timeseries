@@ -4,7 +4,6 @@ from PySide6.QtGui import QIcon
 
 from ui.ConfigWindow_ui import Ui_ConfigWindow
 from ui.AnalysisWindow import AnalysisWindow
-# from ui.FFTWindow import FFTWindow
 
 from serial.tools import list_ports
 from sys import argv
@@ -61,7 +60,6 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
 
         """
         self.start_btn.clicked.connect(self.start_analysis)
-        self.startfft_btn.clicked.connect(self.start_fft_analysis)
         self.inter_combo.currentTextChanged.connect(self.set_port_options)
         self.refreshTimer = QTimer(self)
         self.refreshTimer.timeout.connect(self.update_coms)
@@ -282,32 +280,6 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
             self.refreshTimer.stop()
             self.hide()
 
-    def start_fft_analysis(self):
-        """
-        Inicia a janela de análise FFT com as configurações selecionadas.
-
-        """
-        QApplication.instance().setOverrideCursor(Qt.WaitCursor)
-        cur_dir = os.path.dirname(os.path.abspath(argv[0]))
-
-        config = {
-            'port': self.port_combo.currentText(),
-            'fiber': self.fiber_combo.currentText(),
-            'path': self.file_path,
-            'theme': self.theme,
-        }
-
-        self._save_settings()
-
-        if self.analysis_window is None:
-            # self.analysis_window = FFTWindow()
-            icon = os.path.join(cur_dir, "img", "litel.png")
-            self.analysis_window.setWindowIcon(QIcon(icon))
-            self.analysis_window.closing.connect(lambda theme: self.on_analysis_window_closed(theme))
-            self.analysis_window.load_config(config)
-            self.analysis_window.showMaximized()
-            self.hide()
-
     def on_analysis_window_closed(self, theme: str):
         """
         Callback chamado quando a janela de análise é fechada.
@@ -350,7 +322,6 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         self.start_btn.setEnabled(True)
         self.ip_lbl.setEnabled(True)
         self.ip_lineEdit.setEnabled(True)
-        self.startfft_btn.setEnabled(False)
         self.setTraces(True)
 
     def thorlabs(self):
@@ -364,7 +335,7 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         self.ip_lineEdit.setEnabled(False)
         self.com_lbl.setEnabled(False)
         self.port_combo.setEnabled(False)
-        self.startfft_btn.setEnabled(False)
+        self.start_btn.setEnabled(True)
         self.setTraces(False)
 
     def setSpins(self, min: int, max: int, minVal: int = None, maxVal: int = None):
@@ -440,7 +411,6 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
             else:
                 self.port_combo.setEnabled(True)
                 self.start_btn.setEnabled(True)
-                self.startfft_btn.setEnabled(True)
                 for port in imon:
                     self.port_combo.addItem(port.device)
 

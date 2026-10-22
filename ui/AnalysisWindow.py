@@ -5,7 +5,13 @@ from PySide6.QtCore import Signal, QThread, QTimer, Qt, QLocale, QSettings
 
 from ui.AnalysisWindow_ui import Ui_AnalysisWindow
 from ui.toggle import ToggleSwitch
-from core.processing import find_resonant_wavelength, find_wavelength_peaks, preprocess_plot_data, convert_y_axis_unit
+from core.processing import (
+    find_resonant_wavelength,
+    find_wavelength_peaks,
+    preprocess_plot_data,
+    convert_y_axis_unit,
+    bezier_curve,
+)
 from core.data_acquisition import DataAcquisition
 from iobound.file_manager import append_samples, prompt_save_file, prompt_open_file, load_samples
 
@@ -163,6 +169,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # Parametros do filtro Savitzky-Golay aplicados no plot
         self.savgol_window_points: int = 51
         self.savgol_polyorder: int = 2
+        # Parâmetros da curva de Bézier aplicada somente no plot
+        self.bezier_parameters = {
+            'num_points': 0,
+            'smoothing': 0.3,
+        }
         # Numero de amostras para a média espectral
         self.mean_samples: int = 1
 
@@ -234,6 +245,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.window_btn.clicked.connect(self.select_window_method)
         self.savgol_btn.clicked.connect(self.select_savgol_parameters)
         self.mean_btn.clicked.connect(self.select_mean_samples)
+        self.bezier_btn.clicked.connect(self.select_bezier_parameters)
         self.actionPeaks.triggered.connect(self.select_peak_parameters)
         self.temporal_roi_region.sigRegionChanged.connect(self._temporal_roi_changed)
         self.roi_region.sigRegionChanged.connect(self._spectrum_roi_changed)
@@ -272,6 +284,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.savgol_btn.setIcon(QIcon(svg))
         mean = os.path.join(main_dir, "img", "mean.png")
         self.mean_btn.setIcon(QIcon(mean))
+        bez = os.path.join(main_dir, "img", "bezier.png")
+        self.bezier_btn.setIcon(QIcon(bez))
 
         # Conecta atalhos do teclado
         self.actionOpenFile.setShortcut('Ctrl+A')
@@ -283,6 +297,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.window_btn.setShortcut('J')
         self.savgol_btn.setShortcut('S')
         self.mean_btn.setShortcut('M')
+        self.bezier_btn.setShortcut('B')
         for i, button in enumerate(self._list_fix_buttons()):
             button.setShortcut(f'{i+1}') # Atalhos 1-6 para fixar espectros
 
@@ -421,6 +436,14 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         if key_savgol_poly:
             self.settings.setValue(key_savgol_poly, int(self.savgol_polyorder))
         
+        # Bézier
+        key_bezier_points = self._analysis_mode_key('bezier_num_points')
+        key_bezier_smoothing = self._analysis_mode_key('bezier_smoothing')
+        if key_bezier_points:
+            self.settings.setValue(key_bezier_points, int(self.bezier_parameters['num_points']))
+        if key_bezier_smoothing:
+            self.settings.setValue(key_bezier_smoothing, float(self.bezier_parameters['smoothing']))
+
         # Mean samples
         key_mean = self._analysis_mode_key('mean_samples')
         if key_mean:
@@ -468,6 +491,24 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 polyorder = max(1, window_points - 1)
             self.savgol_window_points = window_points
             self.savgol_polyorder = polyorder
+
+        # Bézier
+        key_bezier_points = self._analysis_mode_key('bezier_num_points')
+        key_bezier_smoothing = self._analysis_mode_key('bezier_smoothing')
+        if key_bezier_points:
+            saved_points = self.settings.value(
+                key_bezier_points,
+                self.bezier_parameters['num_points'],
+                type=int,
+            )
+            self.bezier_parameters['num_points'] = max(0, int(saved_points))
+        if key_bezier_smoothing:
+            saved_smoothing = self.settings.value(
+                key_bezier_smoothing,
+                self.bezier_parameters['smoothing'],
+                type=float,
+            )
+            self.bezier_parameters['smoothing'] = float(np.clip(saved_smoothing, 0.0, 1.0))
         
         # Mean samples
         # Usa padrão específico do instrumento se não houver valor salvo
@@ -1270,13 +1311,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 if trace is None:
                     continue
 
-                x_vals = np.asarray(trace[0], dtype=float)
-                y_vals = preprocess_plot_data(
-                    np.asarray(trace[1], dtype=float),
-                    self.window_methods,
-                    self.savgol_window_points,
-                    self.savgol_polyorder,
-                    self.window,
+                x_vals, y_vals = self._preprocess_curve_for_plot(
+                    trace[0],
+                    trace[1],
                 )
                 y_vals = convert_y_axis_unit(y_vals, self.yUnit)
 
@@ -1345,13 +1382,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     if trace is None:
                         continue
 
-                    x_vals = np.asarray(trace[0], dtype=float)
-                    y_vals = preprocess_plot_data(
-                        np.asarray(trace[1], dtype=float),
-                        self.window_methods,
-                        self.savgol_window_points,
-                        self.savgol_polyorder,
-                        self.window,
+                    x_vals, y_vals = self._preprocess_curve_for_plot(
+                        trace[0],
+                        trace[1],
                     )
                     y_vals = convert_y_axis_unit(y_vals, self.yUnit)
 
@@ -1824,6 +1857,24 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         )
         return processed
 
+    def _preprocess_curve_for_plot(
+        self,
+        x_values: np.ndarray,
+        y_values: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Aplica o processamento visual, incluindo Bézier, a um espectro."""
+        x_values = np.asarray(x_values, dtype=float)
+        y_values = self._preprocess_y_axis(np.asarray(y_values, dtype=float))
+        num_points = int(self.bezier_parameters['num_points'])
+        if num_points >= 2 and len(x_values) >= 2:
+            x_values, y_values = bezier_curve(
+                x_values,
+                y_values,
+                num_points,
+                float(self.bezier_parameters['smoothing']),
+            )
+        return x_values, y_values
+
     def _from_meter(self, values, unit: str):
         """
         Returns:
@@ -1930,6 +1981,48 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.mean_samples = int(value)
         logger.info(f"Número de amostras para mean configurado: {self.mean_samples}")
         self._save_persistent_settings()
+
+    def select_bezier_parameters(self):
+        """
+        Abre um diálogo para configurar a curva de Bézier visual.
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Curva de Bézier')
+        layout = QFormLayout(dialog)
+
+        points_spin = QSpinBox(dialog)
+        points_spin.setRange(0, 10)
+        points_spin.setValue(self.bezier_parameters['num_points'])
+
+        smoothing_spin = QDoubleSpinBox(dialog)
+        smoothing_spin.setRange(0.0, 1.0)
+        smoothing_spin.setDecimals(2)
+        smoothing_spin.setSingleStep(0.05)
+        smoothing_spin.setValue(self.bezier_parameters['smoothing'])
+
+        layout.addRow('Número de pontos:', points_spin)
+        layout.addRow('Suavização:', smoothing_spin)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+        layout.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        self.bezier_parameters['num_points'] = int(points_spin.value())
+        self.bezier_parameters['smoothing'] = float(smoothing_spin.value())
+        logger.info(
+            "Curva de Bézier configurada: pontos=%d, suavização=%.2f",
+            self.bezier_parameters['num_points'],
+            self.bezier_parameters['smoothing'],
+        )
+        self._save_persistent_settings()
+
+        if self.spectra_data:
+            x, y = zip(*self.spectra_data)
+            self._plot_spectrum_curve(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
 
     def select_peak_parameters(self):
         """
@@ -2061,7 +2154,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.spectraPlotWidget.addItem(self.roi_region)
 
         self._set_result_axis_unit()
-        y_values = self._preprocess_y_axis(y_values)
+        x_values, y_values = self._preprocess_curve_for_plot(x_values, y_values)
 
         brush = self._visible_spectrum_brush(x_values)
         plot_kwargs = {'pen': pg.mkPen(self.theme_colors['spectrum'], width=1),}
@@ -2080,9 +2173,30 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     continue
                 color = button.palette().color(QPalette.ColorRole.Button)
                 x = np.asarray(self.fixed_traces[str(button)][0], dtype=float)
-                y = self._preprocess_y_axis(self.fixed_traces[str(button)][1])
+                x, y = self._preprocess_curve_for_plot(
+                    self.fixed_traces[str(button)][0],
+                    self.fixed_traces[str(button)][1],
+                )
                 self.spectraPlotWidget.plot(x, convert_y_axis_unit(y, self.yUnit), 
                                             pen=pg.mkPen(color, width=1, style=Qt.PenStyle.DashLine))
+
+    def _plot_active_fixed_traces(self):
+        """Redesenha apenas os espectros fixados que estão ativos."""
+        for button in self._list_fix_buttons():
+            if not button.isChecked() or str(button) not in self.fixed_traces:
+                continue
+
+            color = button.palette().color(QPalette.ColorRole.Button)
+            x = np.asarray(self.fixed_traces[str(button)][0], dtype=float)
+            x, y = self._preprocess_curve_for_plot(
+                self.fixed_traces[str(button)][0],
+                self.fixed_traces[str(button)][1],
+            )
+            self.spectraPlotWidget.plot(
+                x,
+                convert_y_axis_unit(y, self.yUnit),
+                pen=pg.mkPen(color, width=1),
+            )
 
     def _list_fix_buttons(self) -> list[QPushButton]:
         """
@@ -2747,10 +2861,15 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         if button.isChecked():
             button.setChecked(False)
             if not self._running:
-                x_vals, y_vals = zip(*self.spectra_data)
-                # Redesenha o espectro atual para limpar as curvas fixadas
-                self._plot_spectrum_curve(np.asarray(x_vals, dtype=float), np.asarray(y_vals, dtype=float))
+                if self.spectra_data:
+                    x_vals, y_vals = zip(*self.spectra_data)
+                    # Redesenha o espectro atual para limpar as curvas fixadas
+                    self._plot_spectrum_curve(np.asarray(x_vals, dtype=float), np.asarray(y_vals, dtype=float))
             self._save_active_channel_state(trace_number=trace_number)
+        if not self._running and not self.spectra_data:
+            self.spectraPlotWidget.clear()
+            self.spectraPlotWidget.addItem(self.roi_region)
+            self._plot_active_fixed_traces()
         self._refresh_merge_views()
 
     def toggle_fix(self, button: QPushButton, pos):
@@ -2791,11 +2910,14 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                         pen=pg.mkPen(color, width=1),
                     )
                 else:
-                    x_vals, y_vals = zip(*self.spectra_data)
-                    # Redesenha o espectro atual para limpar as curvas fixadas
-                    self._plot_spectrum_curve(np.asarray(x_vals, dtype=float), np.asarray(y_vals, dtype=float))
+                    if self.spectra_data:
+                        x_vals, y_vals = zip(*self.spectra_data)
+                        # Redesenha o espectro atual para limpar as curvas fixadas
+                        self._plot_spectrum_curve(np.asarray(x_vals, dtype=float), np.asarray(y_vals, dtype=float))
+                    else:
+                        pass
         elif checked:
-            if self.spectraPlotWidget.getPlotItem().listDataItems() == []:
+            if self.spectraPlotWidget.getPlotItem().listDataItems() == [] or not self.spectra_data:
                 button.setChecked(False) # Impede de marcar se não houver espectro para fixar
                 return
             x, y = zip(*self.spectra_data)
@@ -2840,6 +2962,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         else:
             self.active_traces = [str(btn) for btn in self._list_fix_buttons() if btn.isChecked()]
         self._save_active_channel_state(trace_number=trace_number)
+        if not self._running and not self.spectra_data:
+            self.spectraPlotWidget.clear()
+            self.spectraPlotWidget.addItem(self.roi_region)
+            self._plot_active_fixed_traces()
         self._refresh_merge_views()
             
     def _cleanup_thread(self):
@@ -3007,6 +3133,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     self._pause_thread()
                 else:
                     self._resume_thread()
+                self.stop_btn.setShortcut('Return')
             else:
                 self._run()
         except Exception:
@@ -3633,15 +3760,14 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.results_df = self._empty_result_store()
         self.pending_hdf5 = self._empty_result_store()
         self._clear_fbg_peak_colors()
-        # spectraPlotWidget.clear() já removeu os itens; apenas descarta as referências.
         self._peak_marker_lines.clear()
         self.spectra_data = []
         self.roi_range = None
-        self.fixed_traces = {}
-        self._sync_fix_buttons_ui()
+        for b in self._list_fix_buttons():
+            b.setChecked(False)
         self._save_active_channel_state()
         self._refresh_merge_views()
-        logger.info("Gráficos limpos.")
+        logger.debug("Gráficos limpos.")
 
     def _prompt_sample_name(self) -> tuple[str, bool]:
         """

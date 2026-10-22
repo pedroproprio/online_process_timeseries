@@ -551,7 +551,7 @@ class Imon512:
                     break
                 time.sleep(0.1)
             else:
-                raise ConnectionError(f'Unexpected device response after opening port: {response}')
+                raise ConnectionError(f'Unexpected device response after opening port: "{response}"')
         except Exception as e:
             logger.error(f'Communication error after opening port: {e}')
             raise e
@@ -826,7 +826,7 @@ class Imon512:
                     except (AttributeError, OSError, TypeError) as e:
                         raise ValueError(f'Read error in measurement: {e}.')
             else:
-                logger.error('Serial port or internal objects became invalid during measurement')
+                raise RuntimeError('Serial port or internal objects became invalid during measurement')
         self.ask('esc')
         measurements = np.array(measurements, dtype=float)
         if return_single:
